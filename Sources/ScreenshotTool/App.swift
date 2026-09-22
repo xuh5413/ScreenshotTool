@@ -243,19 +243,29 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         manager.overlayWindowNumber = currentOverlay?.overlayWindowNumber
         longScreenshotManager = manager
 
-        manager.onProgress = { msg in
+        manager.onProgress = { [weak self] msg in
             NSLog("[ScreenshotTool] long screenshot: \(msg)")
+            self?.currentOverlay?.updateLongScreenshotStatus(msg)
         }
 
-        manager.onComplete = { [weak self] image, region in
+        manager.onPreviewUpdate = { [weak self] image in
+            self?.currentOverlay?.updateLongScreenshotPreview(image)
+        }
+
+        manager.onCompleteWithAction = { [weak self] image, region, action in
             guard let self = self else { return }
             self.longScreenshotManager = nil
 
             DispatchQueue.main.async {
-                // Exit long screenshot mode
                 self.currentOverlay?.exitLongScreenshotMode()
-                // Show result in annotation mode
-                self.showLongScreenshotResult(image: image, region: region)
+                switch action {
+                case .annotate:
+                    self.showLongScreenshotResult(image: image, region: region)
+                case .copy:
+                    self.copyLongScreenshot(image: image)
+                case .save:
+                    self.saveLongScreenshot(image: image, region: region)
+                }
             }
         }
 
@@ -272,7 +282,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             guard let self = self else { return }
             self.longScreenshotManager = nil
             DispatchQueue.main.async {
-                self.currentOverlay?.exitLongScreenshotMode()
+                self.currentOverlay?.cleanupOverlay()
+                self.currentOverlay = nil
             }
         }
 
@@ -300,6 +311,55 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         currentOverlay?.clearFrozenBackground()
         guard let cgImage = image.cgImage(forProposedRect: nil, context: nil, hints: nil) else { return }
         currentOverlay?.enterAnnotationMode(image: image, cgImage: cgImage, selectionRect: displayRect, canMove: false)
+    }
+
+    private func copyLongScreenshot(image: NSImage) {
+        guard let cgImage = image.cgImage(forProposedRect: nil, context: nil, hints: nil) else { return }
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.writeObjects([NSImage(cgImage: cgImage, size: image.size)])
+        currentOverlay?.cleanupOverlay()
+        currentOverlay = nil
+    }
+
+    private func saveLongScreenshot(image: NSImage, region: CGRect) {
+        guard let cgImage = image.cgImage(forProposedRect: nil, context: nil, hints: nil) else { return }
+        saveCGImage(cgImage)
+    }
+
+    private func saveCGImage(_ cgImage: CGImage) {
+        let writePNG: (CGImage, URL) -> Void = { srcImage, url in
+            let properties: [CFString: Any] = [
+                kCGImagePropertyDPIWidth: 72,
+                kCGImagePropertyDPIHeight: 72,
+            ]
+            guard let destination = CGImageDestinationCreateWithURL(url as CFURL, UTType.png.identifier as CFString, 1, nil) else { return }
+            CGImageDestinationAddImage(destination, srcImage, properties as CFDictionary)
+            CGImageDestinationFinalize(destination)
+        }
+
+        if let dir = defaultSavePath() {
+            let filename = "长截图_\(formattedDate()).png"
+            let url = dir.appendingPathComponent(filename)
+            writePNG(cgImage, url)
+            currentOverlay?.cleanupOverlay()
+            currentOverlay = nil
+            return
+        }
+
+        let panel = NSSavePanel()
+        panel.allowedContentTypes = [.png]
+        panel.nameFieldStringValue = "长截图_\(formattedDate()).png"
+
+        panel.begin { [weak self] response in
+            guard response == .OK, let url = panel.url else {
+                self?.currentOverlay?.cleanupOverlay()
+                self?.currentOverlay = nil
+                return
+            }
+            writePNG(cgImage, url)
+            self?.currentOverlay?.cleanupOverlay()
+            self?.currentOverlay = nil
+        }
     }
 
     // MARK: - ScreenCaptureKit Capture

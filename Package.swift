@@ -10,9 +10,31 @@ let package = Package(
         .executable(name: "ScreenshotTool", targets: ["ScreenshotTool"])
     ],
     targets: [
+        .target(
+            name: "LongScreenshotCore"
+        ),
+        .target(
+            name: "ScreenshotToolbarCore"
+        ),
         .executableTarget(
             name: "ScreenshotTool",
+            dependencies: ["LongScreenshotCore", "ScreenshotToolbarCore"],
             exclude: ["Info.plist", "Entitlements.plist", "AppIcon.icns"]
+        ),
+        .executableTarget(
+            name: "LongScreenshotCoreChecks",
+            dependencies: ["LongScreenshotCore"],
+            path: "Tests/ScreenshotToolTests"
+        ),
+        .executableTarget(
+            name: "LongScreenshotImageChecks",
+            dependencies: ["LongScreenshotCore"],
+            path: "Tests/LongScreenshotImageChecks"
+        ),
+        .executableTarget(
+            name: "ScreenshotToolbarChecks",
+            dependencies: ["ScreenshotToolbarCore"],
+            path: "Tests/ScreenshotToolbarChecks"
         )
     ]
 )

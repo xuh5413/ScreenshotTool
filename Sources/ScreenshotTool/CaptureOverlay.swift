@@ -1,4 +1,5 @@
 import Cocoa
+import ScreenshotToolbarCore
 
 // MARK: - Result
 
@@ -68,6 +69,10 @@ final class CaptureOverlay: NSObject {
     /// representation size ambiguity on Retina displays.
     var onPinCGImage: ((CGImage, NSSize, CGRect) -> Void)?
     var onLongScreenshot: ((CGRect) -> Void)?
+    var onLongScreenshotFromSelection: ((CGRect) -> Void)? {
+        get { overlayView?.onLongScreenshotFromSelection }
+        set { overlayView?.onLongScreenshotFromSelection = newValue }
+    }
 
     private var overlayWindow: NSWindow?
     private var overlayView: OverlayView?
@@ -147,15 +152,25 @@ final class CaptureOverlay: NSObject {
     }
 
     func enterLongScreenshotMode(selectionRect: CGRect) {
+        overlayWindow?.level = .floating
         overlayWindow?.ignoresMouseEvents = true
         overlayView?.enterLongScreenshotMode(globalRect: selectionRect)
     }
 
     func exitLongScreenshotMode() {
+        overlayWindow?.level = .screenSaver
         overlayWindow?.ignoresMouseEvents = false
         overlayView?.exitLongScreenshotMode()
         overlayWindow?.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
+    }
+
+    func updateLongScreenshotPreview(_ image: NSImage) {
+        overlayView?.updateLongScreenshotPreview(image)
+    }
+
+    func updateLongScreenshotStatus(_ message: String) {
+        overlayView?.updateLongScreenshotStatus(message)
     }
 
     func cleanupOverlay() {
@@ -191,6 +206,7 @@ private class OverlayView: NSView {
     var onPinAction: ((NSImage, CGRect) -> Void)?
     var onPinCGImage: ((CGImage, NSSize, CGRect) -> Void)?
     var onLongScreenshot: ((CGRect) -> Void)?
+    var onLongScreenshotFromSelection: ((CGRect) -> Void)?
     var screenOffset = CGPoint.zero
 
     // Frozen background (pre-captured screenshot)
@@ -252,9 +268,13 @@ private class OverlayView: NSView {
     // MARK: - Long Screenshot Mode
 
     private var longScreenshotGlobalRect: CGRect = .null
+    private var longScreenshotPreviewImage: NSImage?
+    private var longScreenshotStatusText = "等待滚动…"
 
     func enterLongScreenshotMode(globalRect: CGRect) {
         self.longScreenshotGlobalRect = globalRect
+        self.longScreenshotPreviewImage = nil
+        self.longScreenshotStatusText = "等待滚动…"
         mode = .longScreenshotting
         hideTooltip()
         tooltipTargetID = nil
@@ -267,12 +287,26 @@ private class OverlayView: NSView {
         selectionRect = .null
         highlightedWindowRect = nil
         isSelecting = false
+        longScreenshotPreviewImage = nil
+        longScreenshotStatusText = "等待滚动…"
+        needsDisplay = true
+    }
+
+    func updateLongScreenshotPreview(_ image: NSImage) {
+        longScreenshotPreviewImage = image
+        needsDisplay = true
+    }
+
+    func updateLongScreenshotStatus(_ message: String) {
+        longScreenshotStatusText = message
         needsDisplay = true
     }
 
     // MARK: - Selection Move / Resize in Annotation Mode
 
     private var canMoveSelection = true
+    private var originallyMovableSelection = true
+    private var annotationToolbarExpanded = false
 
     private enum AnnDrag { case none, move, resizeLeft, resizeRight, resizeTop, resizeBottom, resizeTopLeft, resizeTopRight, resizeBottomLeft, resizeBottomRight }
     private var annDrag: AnnDrag = .none
@@ -293,41 +327,25 @@ private class OverlayView: NSView {
     // MARK: - Toolbar Layout
 
     private struct ToolbarLayout {
-        static let height: CGFloat = 36
-        static let pad: CGFloat = 4
-        static let toolSize = CGSize(width: 30, height: 26)
-        static let swatchSize = CGSize(width: 16, height: 16)
-        static let actionWidth: CGFloat = 36
-        static let sepW: CGFloat = 12 // space around separator
-
-        static let toolIDs: [(AnnotationTool, String)] = [
-            (.rectangle, "rectangle"),
-            (.ellipse, "circle"),
-            (.highlight, "sun.max"),
-            (.arrow, "arrow.up.right"),
-            (.mosaic, "square.grid.3x3.fill"),
-            (.text, "textformat"),
-            (.number, "textformat.123"),
-        ]
+        static let height: CGFloat = 42
+        static let pad: CGFloat = 6
+        static let gap: CGFloat = 4
 
         static let swatchColors: [NSColor] = [
             .red, .systemOrange, .systemYellow, .systemGreen,
             .systemCyan, .systemBlue, .systemPurple, .white, .black,
         ]
 
-        static let actionIDs: [(String, String)] = [
-            ("undo", "arrow.uturn.backward"),
-            ("save", "arrow.down.to.line"),
-            ("copy", "doc.on.doc"),
-            ("pin", "pin"),
-            ("cancel", "xmark"),
-        ]
+        static func buttonWidth(_ button: ScreenshotToolbarButton) -> CGFloat {
+            if button.id == "more" { return 52 }
+            if let title = button.title {
+                return title == "长截图" ? 86 : title == "返回" ? 62 : 70
+            }
+            return 32
+        }
 
-        static func totalWidth() -> CGFloat {
-            let toolsW = CGFloat(toolIDs.count) * toolSize.width + CGFloat(toolIDs.count - 1) * pad
-            let swatchesW = CGFloat(swatchColors.count) * swatchSize.width + CGFloat(swatchColors.count - 1) * 4
-            let actionsW = CGFloat(actionIDs.count) * actionWidth + CGFloat(actionIDs.count - 1) * pad
-            return toolsW + sepW + swatchesW + sepW + actionsW + pad * 2
+        static func totalWidth(_ buttons: [ScreenshotToolbarButton]) -> CGFloat {
+            CGFloat(buttons.count - 1) * gap + buttons.reduce(0) { $0 + buttonWidth($1) } + pad * 2
         }
     }
 
@@ -392,6 +410,8 @@ private class OverlayView: NSView {
         selectedAnnotationIndex = nil
         inProgressItem = nil
         canMoveSelection = canMove
+        originallyMovableSelection = canMove
+        annotationToolbarExpanded = false
         annDrag = .none
         annDragStart = .zero
         annDragStartRect = .zero
@@ -851,7 +871,6 @@ private class OverlayView: NSView {
     private func drawLongScreenshot(_ ctx: CGContext) {
         let r = longScreenshotGlobalRect
 
-        // Dim outside the selection area (lighter dim so user can see context)
         let localRect = CGRect(
             x: r.origin.x - screenOffset.x,
             y: r.origin.y - screenOffset.y,
@@ -863,18 +882,99 @@ private class OverlayView: NSView {
             CGRect(x: localRect.maxX, y: localRect.minY, width: bounds.maxX - localRect.maxX, height: localRect.height),
             CGRect(x: bounds.minX, y: localRect.maxY, width: bounds.width, height: bounds.maxY - localRect.maxY),
         ]
-        ctx.setFillColor(NSColor.black.withAlphaComponent(0.4).cgColor)
+        ctx.setFillColor(NSColor.black.withAlphaComponent(0.58).cgColor)
         for rect in outsideRects where rect.width > 0 && rect.height > 0 {
             ctx.fill(rect)
         }
 
-        // Selection border
-        ctx.setStrokeColor(NSColor.systemBlue.cgColor)
+        ctx.setStrokeColor(NSColor.systemBlue.withAlphaComponent(0.95).cgColor)
         ctx.setLineWidth(2)
         ctx.stroke(localRect)
 
-        // Dimension label
         drawSelectionLabel(ctx, rect: localRect)
+        drawLongScreenshotPreview(ctx, selectionRect: localRect)
+    }
+
+    private func drawLongScreenshotPreview(_ ctx: CGContext, selectionRect: CGRect) {
+        let previewW: CGFloat = 150
+        let previewH = min(bounds.height - 80, max(260, selectionRect.height))
+        let gap: CGFloat = 24
+        var x = selectionRect.maxX + gap
+        if x + previewW > bounds.maxX - 20 {
+            x = selectionRect.minX - gap - previewW
+        }
+        if x < bounds.minX + 20 {
+            x = max(bounds.minX + 20, selectionRect.maxX - previewW - 12)
+        }
+
+        let y = min(max(selectionRect.maxY - previewH, bounds.minY + 40), bounds.maxY - previewH - 40)
+        let previewRect = CGRect(x: x, y: y, width: previewW, height: previewH)
+
+        NSGraphicsContext.saveGraphicsState()
+        let shadow = NSShadow()
+        shadow.shadowColor = NSColor.black.withAlphaComponent(0.35)
+        shadow.shadowBlurRadius = 18
+        shadow.shadowOffset = NSSize(width: 0, height: -4)
+        shadow.set()
+        let bgPath = NSBezierPath(roundedRect: previewRect, xRadius: 2, yRadius: 2)
+        NSColor.white.setFill()
+        bgPath.fill()
+        NSGraphicsContext.restoreGraphicsState()
+
+        ctx.setStrokeColor(NSColor.white.withAlphaComponent(0.9).cgColor)
+        ctx.setLineWidth(1)
+        ctx.stroke(previewRect)
+
+        let contentRect = previewRect.insetBy(dx: 8, dy: 8)
+        ctx.saveGState()
+        ctx.clip(to: contentRect)
+        if let image = longScreenshotPreviewImage, image.size.width > 0, image.size.height > 0 {
+            var scale = contentRect.width / image.size.width
+            let drawH = image.size.height * scale
+            if drawH > contentRect.height {
+                scale = contentRect.height / image.size.height
+            }
+            let drawW = image.size.width * scale
+            let drawRect = CGRect(
+                x: contentRect.midX - drawW / 2,
+                y: contentRect.maxY - min(drawH, contentRect.height),
+                width: drawW,
+                height: min(drawH, contentRect.height)
+            )
+            image.draw(in: drawRect)
+        } else {
+            for i in 0..<18 {
+                let rowY = previewRect.maxY - 18 - CGFloat(i) * 16
+                let lineW = previewW - CGFloat((i % 4) * 14) - 28
+                ctx.setFillColor(NSColor.black.withAlphaComponent(i % 5 == 0 ? 0.18 : 0.1).cgColor)
+                ctx.fill(CGRect(x: previewRect.minX + 14, y: rowY, width: lineW, height: 4))
+            }
+        }
+        ctx.restoreGState()
+
+        let statusFont = NSFont.systemFont(ofSize: 12, weight: .medium)
+        let statusAttributes: [NSAttributedString.Key: Any] = [
+            .font: statusFont,
+            .foregroundColor: NSColor.white,
+        ]
+        let statusSize = (longScreenshotStatusText as NSString).size(withAttributes: statusAttributes)
+        let statusWidth = min(bounds.width - 16, statusSize.width + 18)
+        let statusX = max(
+            bounds.minX + 8,
+            min(previewRect.midX - statusWidth / 2, bounds.maxX - statusWidth - 8)
+        )
+        let statusRect = CGRect(
+            x: statusX,
+            y: previewRect.minY - 28,
+            width: statusWidth,
+            height: 22
+        )
+        NSColor.black.withAlphaComponent(0.72).setFill()
+        NSBezierPath(roundedRect: statusRect, xRadius: 7, yRadius: 7).fill()
+        (longScreenshotStatusText as NSString).draw(
+            in: statusRect.insetBy(dx: 9, dy: 4),
+            withAttributes: statusAttributes
+        )
     }
 
     // MARK: - Annotation Drawing
@@ -1279,8 +1379,11 @@ private class OverlayView: NSView {
 
     private func drawToolbar(_ ctx: CGContext) {
         let cr = captureRectLocal
+        let buttons = ScreenshotToolbarConfiguration.buttons(
+            for: annotationToolbarExpanded ? .annotating : .quick
+        )
         let tH = ToolbarLayout.height
-        let tW = ToolbarLayout.totalWidth()
+        let tW = ToolbarLayout.totalWidth(buttons)
 
         // Position below capture rect, centered
         var tX = cr.midX - tW / 2
@@ -1293,173 +1396,60 @@ private class OverlayView: NSView {
         toolbarHitRects = [:]
 
         // Background
-        let bg = NSBezierPath(roundedRect: toolbarGlobalRect, xRadius: 6, yRadius: 6)
-        NSColor.black.withAlphaComponent(0.7).setFill()
+        let bg = NSBezierPath(roundedRect: toolbarGlobalRect, xRadius: 10, yRadius: 10)
+        NSColor.black.withAlphaComponent(0.82).setFill()
         bg.fill()
         ctx.setStrokeColor(NSColor.white.withAlphaComponent(0.15).cgColor)
         ctx.setLineWidth(0.5)
         bg.stroke()
 
-        let pad = ToolbarLayout.pad
-        var curX = tX + pad
-
-        // --- Tool buttons ---
-        let whiteConfig = NSImage.SymbolConfiguration(paletteColors: [NSColor.white])
-
-        // Pre-render custom tool icons
-        let textImg: NSImage? = {
-            let s = ToolbarLayout.toolSize
-            let i = NSImage(size: NSSize(width: s.width - 8, height: s.height - 6), flipped: true) { _ in
-                let attrs: [NSAttributedString.Key: Any] = [
-                    .font: NSFont.boldSystemFont(ofSize: round(s.height * 0.65)),
-                    .foregroundColor: NSColor.white,
-                ]
-                let str = "A" as NSString
-                let strSize = str.size(withAttributes: attrs)
-                str.draw(at: CGPoint(x: ((s.width - 8) - strSize.width) / 2, y: ((s.height - 6) - strSize.height) / 2), withAttributes: attrs)
-                return true
-            }
-            return i
-        }()
-        let mosaicImg: NSImage? = {
-            let s = ToolbarLayout.toolSize
-            let i = NSImage(size: NSSize(width: s.width - 8, height: s.height - 8), flipped: true) { _ in
-                guard let c = NSGraphicsContext.current?.cgContext else { return false }
-                let cw = (s.width - 14) / 4
-                let ch = (s.height - 14) / 4
-                for row in 0..<4 {
-                    for col in 0..<4 {
-                        let rr = CGRect(x: 3 + CGFloat(col) * cw, y: 3 + CGFloat(row) * ch, width: cw, height: ch)
-                        let fill: CGFloat = ((row + col) % 3 == 0) ? 0.7 : ((row + col) % 3 == 1) ? 0.4 : 0.2
-                        c.setFillColor(NSColor.white.withAlphaComponent(fill).cgColor)
-                        c.fill(rr)
-                        c.setStrokeColor(NSColor.white.withAlphaComponent(0.5).cgColor)
-                        c.setLineWidth(0.5)
-                        c.stroke(rr)
-                    }
-                }
-                return true
-            }
-            return i
-        }()
-        let numberImg: NSImage? = {
-            let s = ToolbarLayout.toolSize
-            let side = min(s.width, s.height) - 8
-            let imgSize = NSSize(width: side, height: side)
-            let i = NSImage(size: imgSize, flipped: true) { _ in
-                guard let c = NSGraphicsContext.current?.cgContext else { return false }
-                let r = CGRect(origin: .zero, size: imgSize).insetBy(dx: 2, dy: 2)
-                c.setStrokeColor(NSColor.white.cgColor)
-                c.setLineWidth(1.5)
-                c.strokeEllipse(in: r)
-
-                let attrs: [NSAttributedString.Key: Any] = [
-                    .font: NSFont.boldSystemFont(ofSize: round(side * 0.55)),
-                    .foregroundColor: NSColor.white,
-                ]
-                let num = "1" as NSString
-                let numSize = num.size(withAttributes: attrs)
-                num.draw(at: CGPoint(
-                    x: (imgSize.width - numSize.width) / 2,
-                    y: (imgSize.height - numSize.height) / 2
-                ), withAttributes: attrs)
-                return true
-            }
-            return i
-        }()
-
-        for (tool, symbol) in ToolbarLayout.toolIDs {
+        var curX = tX + ToolbarLayout.pad
+        let whiteConfig = NSImage.SymbolConfiguration(paletteColors: [.white])
+        for button in buttons {
+            let buttonHeight: CGFloat = 30
             let rect = CGRect(
-                x: curX, y: tY + (tH - ToolbarLayout.toolSize.height) / 2,
-                width: ToolbarLayout.toolSize.width, height: ToolbarLayout.toolSize.height
+                x: curX, y: tY + (tH - buttonHeight) / 2,
+                width: ToolbarLayout.buttonWidth(button), height: buttonHeight
             )
-            toolbarHitRects["tool_\(tool.rawValue)"] = rect
+            toolbarHitRects[button.id] = rect
 
-            if tool == currentTool && !canMoveSelection {
-                ctx.setFillColor(NSColor.white.withAlphaComponent(0.2).cgColor)
-                let sel = NSBezierPath(roundedRect: rect, xRadius: 4, yRadius: 4)
-                sel.fill()
+            let isSelectedTool = button.id.hasPrefix("tool_") &&
+                Int(button.id.dropFirst(5)) == currentTool.rawValue && !canMoveSelection
+            if button.isPrimary || isSelectedTool {
+                let fill = button.isPrimary ? NSColor.systemBlue : NSColor.white.withAlphaComponent(0.2)
+                fill.setFill()
+                NSBezierPath(roundedRect: rect, xRadius: 7, yRadius: 7).fill()
             }
 
-            if tool == .text {
-                textImg?.draw(in: rect.insetBy(dx: 4, dy: 3))
-            } else if tool == .mosaic {
-                mosaicImg?.draw(in: rect.insetBy(dx: 4, dy: 3))
-            } else if tool == .number {
-                let drawRect = rect.insetBy(dx: 4, dy: 3)
-                let side = min(drawRect.width, drawRect.height)
-                let centered = CGRect(
-                    x: drawRect.midX - side / 2,
-                    y: drawRect.midY - side / 2,
-                    width: side,
-                    height: side
-                )
-                numberImg?.draw(in: centered)
-            } else {
-                let img = NSImage(systemSymbolName: symbol, accessibilityDescription: nil)?
-                    .withSymbolConfiguration(whiteConfig)
-                img?.draw(in: rect.insetBy(dx: 4, dy: 3))
-            }
-
-            curX = rect.maxX + pad
-        }
-
-        // Separator
-        curX += ToolbarLayout.sepW / 2
-        ctx.setFillColor(NSColor.white.withAlphaComponent(0.2).cgColor)
-        ctx.fill(CGRect(x: curX, y: tY + 7, width: 1, height: tH - 14))
-        curX += ToolbarLayout.sepW / 2
-
-        // --- Color swatches ---
-        for (i, color) in ToolbarLayout.swatchColors.enumerated() {
-            let rect = CGRect(
-                x: curX, y: tY + (tH - ToolbarLayout.swatchSize.height) / 2,
-                width: ToolbarLayout.swatchSize.width, height: ToolbarLayout.swatchSize.height
-            )
-            toolbarHitRects["color_\(i)"] = rect
-
-            ctx.setFillColor(color.cgColor)
-            ctx.fillEllipse(in: rect)
-
-            if color == currentColor {
+            if button.id == "color_picker" {
+                ctx.setFillColor(currentColor.cgColor)
+                ctx.fillEllipse(in: rect.insetBy(dx: 7, dy: 6))
                 ctx.setStrokeColor(NSColor.white.cgColor)
-                ctx.setLineWidth(2)
-                ctx.strokeEllipse(in: rect.insetBy(dx: 1, dy: 1))
+                ctx.setLineWidth(1.5)
+                ctx.strokeEllipse(in: rect.insetBy(dx: 7, dy: 6))
             } else {
-                ctx.setStrokeColor(NSColor.white.withAlphaComponent(0.3).cgColor)
-                ctx.setLineWidth(0.5)
-                ctx.strokeEllipse(in: rect)
+                if !button.symbol.isEmpty {
+                    let iconSize: CGFloat = button.title == nil ? 17 : 15
+                    let iconX = button.title == nil ? rect.midX - iconSize / 2 : rect.minX + 9
+                    let iconRect = CGRect(x: iconX, y: rect.midY - iconSize / 2,
+                                          width: iconSize, height: iconSize)
+                    NSImage(systemSymbolName: button.symbol, accessibilityDescription: button.title)?
+                        .withSymbolConfiguration(whiteConfig)?.draw(in: iconRect)
+                }
+                if let title = button.title {
+                    let attributes: [NSAttributedString.Key: Any] = [
+                        .font: NSFont.systemFont(ofSize: 12, weight: button.isPrimary ? .semibold : .medium),
+                        .foregroundColor: NSColor.white,
+                    ]
+                    let text = title as NSString
+                    let textSize = text.size(withAttributes: attributes)
+                    let textX = button.symbol.isEmpty ? rect.midX - textSize.width / 2 : rect.minX + 29
+                    text.draw(at: CGPoint(x: textX, y: rect.midY - textSize.height / 2),
+                              withAttributes: attributes)
+                }
             }
 
-            curX = rect.maxX + 4
-        }
-
-        // Separator
-        curX += ToolbarLayout.sepW / 2
-        ctx.setFillColor(NSColor.white.withAlphaComponent(0.2).cgColor)
-        ctx.fill(CGRect(x: curX, y: tY + 7, width: 1, height: tH - 14))
-        curX += ToolbarLayout.sepW / 2
-
-        // --- Action buttons ---
-        for (id, symbol) in ToolbarLayout.actionIDs {
-            let rect = CGRect(
-                x: curX, y: tY + (tH - ToolbarLayout.toolSize.height) / 2,
-                width: ToolbarLayout.actionWidth, height: ToolbarLayout.toolSize.height
-            )
-            toolbarHitRects[id] = rect
-
-            let tint = NSColor.white
-            let config = NSImage.SymbolConfiguration(paletteColors: [tint])
-            let img = NSImage(systemSymbolName: symbol, accessibilityDescription: nil)?
-                .withSymbolConfiguration(config)
-            let iconSize = min(rect.width, rect.height) - 8
-            let iconRect = CGRect(
-                x: rect.midX - iconSize / 2, y: rect.midY - iconSize / 2,
-                width: iconSize, height: iconSize
-            )
-            img?.draw(in: iconRect)
-
-            curX = rect.maxX + pad
+            curX = rect.maxX + ToolbarLayout.gap
         }
     }
 
@@ -1468,9 +1458,11 @@ private class OverlayView: NSView {
 
     private func showTooltip(for id: String, buttonRect: CGRect) {
         let tips: [String: String] = [
+            "annotate": "标注", "back": "返回截图", "more": "更多操作",
+            "color_picker": "选择颜色",
             "tool_0": "箭头", "tool_1": "文字", "tool_2": "编号",
             "tool_3": "马赛克", "tool_4": "矩形", "tool_5": "椭圆", "tool_6": "高亮",
-            "undo": "撤销", "save": "保存", "copy": "复制",
+            "undo": "撤销", "longscreenshot": "长截图", "save": "保存", "copy": "复制",
             "pin": "固定", "cancel": "取消",
         ]
         guard let text = tips[id] else { hideTooltip(); return }
@@ -1511,6 +1503,11 @@ private class OverlayView: NSView {
     }
 
     // MARK: - Mouse Events
+
+    override func hitTest(_ point: NSPoint) -> NSView? {
+        if mode == .longScreenshotting { return nil }
+        return super.hitTest(point)
+    }
 
     override func mouseDown(with event: NSEvent) {
         switch mode {
@@ -1785,6 +1782,7 @@ private class OverlayView: NSView {
     private func confirmSelection() {
         guard selectionRect.width >= 10 && selectionRect.height >= 10 else { return }
         let globalSel = globalRect(selectionRect)
+
         adjustDrag = .none
         selectionRect = .null
         needsDisplay = true
@@ -1820,7 +1818,11 @@ private class OverlayView: NSView {
 
         if let hitID = hitTestToolbar(pt) {
             NSCursor.pointingHand.set()
-            if hitID != tooltipTargetID {
+            let toolbarMode: ScreenshotToolbarMode = annotationToolbarExpanded ? .annotating : .quick
+            if !ScreenshotToolbarConfiguration.showsHoverTooltips(for: toolbarMode) {
+                tooltipTargetID = nil
+                hideTooltip()
+            } else if hitID != tooltipTargetID {
                 tooltipTargetID = hitID
                 if let rect = toolbarHitRects[hitID] {
                     showTooltip(for: hitID, buttonRect: rect)
@@ -1845,7 +1847,7 @@ private class OverlayView: NSView {
                         NSCursor.arrow.set()
                     }
                 }
-            } else if captureRectLocal.contains(pt) {
+            } else if annotationToolbarExpanded && captureRectLocal.contains(pt) {
                 NSCursor.crosshair.set()
             } else {
                 NSCursor.arrow.set()
@@ -1895,7 +1897,7 @@ private class OverlayView: NSView {
             return
         }
 
-        guard captureRectLocal.contains(viewPt) else { return }
+        guard annotationToolbarExpanded, captureRectLocal.contains(viewPt) else { return }
 
         let imagePt = viewToImage(viewPt)
 
@@ -2116,6 +2118,34 @@ private class OverlayView: NSView {
     }
 
     private func handleToolbarAction(_ id: String) {
+        if id == "annotate" {
+            annotationToolbarExpanded = true
+            canMoveSelection = false
+            hideTooltip()
+            tooltipTargetID = nil
+            needsDisplay = true
+            return
+        }
+
+        if id == "back" {
+            annotationToolbarExpanded = false
+            canMoveSelection = originallyMovableSelection && annotations.isEmpty
+            hideTooltip()
+            tooltipTargetID = nil
+            needsDisplay = true
+            return
+        }
+
+        if id == "more" {
+            showMoreMenu()
+            return
+        }
+
+        if id == "color_picker" {
+            showColorMenu()
+            return
+        }
+
         if id == "cancel" {
             onAnnotationCancel?()
             return
@@ -2167,15 +2197,43 @@ private class OverlayView: NSView {
 
         // Color selection
         if id.hasPrefix("color_"), let idx = Int(id.replacingOccurrences(of: "color_", with: "")) {
-            let colors: [NSColor] = [
-                .red, .systemOrange, .systemYellow, .systemGreen,
-                .systemCyan, .systemBlue, .systemPurple, .white, .black,
-            ]
-            if idx < colors.count {
-                currentColor = colors[idx]
+            if ToolbarLayout.swatchColors.indices.contains(idx) {
+                currentColor = ToolbarLayout.swatchColors[idx]
                 needsDisplay = true
             }
         }
+    }
+
+    private func showMoreMenu() {
+        guard let rect = toolbarHitRects["more"] else { return }
+        let menu = NSMenu()
+        for action in ScreenshotToolbarConfiguration.moreActions {
+            let title = action == "save" ? "保存到文件…" : "取消截图"
+            let item = NSMenuItem(title: title, action: #selector(toolbarMenuAction(_:)), keyEquivalent: "")
+            item.target = self
+            item.representedObject = action
+            menu.addItem(item)
+        }
+        menu.popUp(positioning: nil, at: NSPoint(x: rect.minX, y: rect.minY), in: self)
+    }
+
+    private func showColorMenu() {
+        guard let rect = toolbarHitRects["color_picker"] else { return }
+        let names = ["红色", "橙色", "黄色", "绿色", "青色", "蓝色", "紫色", "白色", "黑色"]
+        let menu = NSMenu()
+        for (index, name) in names.enumerated() {
+            let item = NSMenuItem(title: name, action: #selector(toolbarMenuAction(_:)), keyEquivalent: "")
+            item.target = self
+            item.representedObject = "color_\(index)"
+            item.state = currentColor == ToolbarLayout.swatchColors[index] ? .on : .off
+            menu.addItem(item)
+        }
+        menu.popUp(positioning: nil, at: NSPoint(x: rect.minX, y: rect.minY), in: self)
+    }
+
+    @objc private func toolbarMenuAction(_ sender: NSMenuItem) {
+        guard let action = sender.representedObject as? String else { return }
+        handleToolbarAction(action)
     }
 
     // MARK: - Hit Testing (for select tool)
@@ -2263,6 +2321,12 @@ private class OverlayView: NSView {
 
     override func keyDown(with event: NSEvent) {
         if mode == .longScreenshotting { return }
+
+        if mode == .annotating && activeTextField == nil &&
+            (event.keyCode == 0x24 || event.keyCode == 0x4C) { // Return / Enter
+            handleToolbarAction("copy")
+            return
+        }
 
         if mode == .adjusting {
             if event.keyCode == 53 { // Escape
