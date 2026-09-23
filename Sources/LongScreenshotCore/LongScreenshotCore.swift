@@ -125,6 +125,17 @@ public struct LongScreenshotMatcher: Sendable {
 
         let minimumOverlap = min(40, max(3, height / 10))
         let maximumDistance = height - minimumOverlap
+        if let expectedDistance,
+           (1...maximumDistance).contains(expectedDistance),
+           let fastMatch = matchNearExpectedDistance(
+               previous: previous.rows,
+               current: current.rows,
+               expectedDistance: expectedDistance,
+               maximumDistance: maximumDistance
+           ) {
+            return fastMatch
+        }
+
         var coarseCandidates: [(direction: LongScreenshotScrollDirection, distance: Int, score: Double)] = []
         coarseCandidates.reserveCapacity(maximumDistance * 2)
         for distance in 1...maximumDistance {
@@ -217,6 +228,85 @@ public struct LongScreenshotMatcher: Sendable {
             )
         }
         return nil
+    }
+
+    // Most adjacent accepted frames move by roughly the same amount. A clearly
+    // unique nearby alignment avoids scanning every possible displacement;
+    // uncertain results still use the exhaustive search above.
+    private func matchNearExpectedDistance(
+        previous: [[Int]],
+        current: [[Int]],
+        expectedDistance: Int,
+        maximumDistance: Int
+    ) -> LongScreenshotMatch? {
+        let height = previous.count
+        let radius = max(24, expectedDistance / 4)
+        let lower = max(1, expectedDistance - radius)
+        let upper = min(maximumDistance, expectedDistance + radius)
+        var nearby: [(direction: LongScreenshotScrollDirection, distance: Int, score: Double)] = []
+        nearby.reserveCapacity((upper - lower + 1) * 2)
+        for distance in lower...upper {
+            for direction in [LongScreenshotScrollDirection.down, .up] {
+                let rawScore = quickOverlapScore(
+                    previous: previous,
+                    current: current,
+                    distance: distance,
+                    direction: direction,
+                    maximumRowSamples: 24
+                )
+                nearby.append((direction, distance, regularized(rawScore, distance: distance, height: height)))
+            }
+        }
+        nearby.sort { $0.score < $1.score }
+        guard let coarseBest = nearby.first,
+              coarseBest.distance > lower,
+              coarseBest.distance < upper,
+              coarseBest.score <= 3 else { return nil }
+
+        let finalists = nearby.prefix(12).map { candidate in
+            (
+                direction: candidate.direction,
+                distance: candidate.distance,
+                score: regularized(
+                    overlapScore(
+                        previous: previous,
+                        current: current,
+                        distance: candidate.distance,
+                        direction: candidate.direction,
+                        maximumRowSamples: 512,
+                        sparseTextFallback: false
+                    ),
+                    distance: candidate.distance,
+                    height: height
+                )
+            )
+        }.sorted { $0.score < $1.score }
+        guard let best = finalists.first,
+              best.distance > lower,
+              best.distance < upper,
+              best.score <= 3,
+              let secondDistinct = finalists.dropFirst().first(where: {
+                  $0.direction != best.direction || abs($0.distance - best.distance) > 1
+              }),
+              secondDistinct.score - best.score >= 3 else { return nil }
+
+        return LongScreenshotMatch(
+            direction: best.direction,
+            scrollDistance: best.distance,
+            fixedTopRows: fixedTopRows(
+                previous: previous,
+                current: current,
+                distance: best.distance,
+                direction: best.direction
+            ),
+            fixedBottomRows: fixedBottomRows(
+                previous: previous,
+                current: current,
+                distance: best.distance,
+                direction: best.direction
+            ),
+            confidence: min(1, (secondDistinct.score - best.score) / max(1, best.score))
+        )
     }
 
     private func regularized(_ score: Double, distance: Int, height: Int) -> Double {

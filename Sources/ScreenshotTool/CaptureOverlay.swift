@@ -13,6 +13,23 @@ enum CaptureResult {
 
 enum AnnotationTool: Int, CaseIterable {
     case arrow, text, number, mosaic, rectangle, ellipse, highlight, select
+
+    var toolbarButtonID: String? {
+        switch self {
+        case .arrow: return "tool_arrow"
+        case .text: return "tool_text"
+        case .number: return "tool_number"
+        case .mosaic: return "tool_mosaic"
+        case .rectangle: return "tool_rectangle"
+        case .ellipse: return "tool_ellipse"
+        case .highlight: return "tool_highlight"
+        case .select: return nil
+        }
+    }
+
+    static func toolbarTool(for buttonID: String) -> AnnotationTool? {
+        allCases.first { $0.toolbarButtonID == buttonID }
+    }
 }
 
 struct AnnotationItem {
@@ -327,9 +344,10 @@ private class OverlayView: NSView {
     // MARK: - Toolbar Layout
 
     private struct ToolbarLayout {
-        static let height: CGFloat = 42
-        static let pad: CGFloat = 6
-        static let gap: CGFloat = 4
+        static let height = ScreenshotToolbarMetrics.height
+        static let pad = ScreenshotToolbarMetrics.horizontalPadding
+        static let gap = ScreenshotToolbarMetrics.buttonGap
+        static let separatorWidth: CGFloat = 13
 
         static let swatchColors: [NSColor] = [
             .red, .systemOrange, .systemYellow, .systemGreen,
@@ -337,15 +355,23 @@ private class OverlayView: NSView {
         ]
 
         static func buttonWidth(_ button: ScreenshotToolbarButton) -> CGFloat {
-            if button.id == "more" { return 52 }
-            if let title = button.title {
-                return title == "长截图" ? 86 : title == "返回" ? 62 : 70
-            }
-            return 32
+            ScreenshotToolbarMetrics.buttonSize
+        }
+
+        static func hasSeparator(
+            before button: ScreenshotToolbarButton,
+            in buttons: [ScreenshotToolbarButton]
+        ) -> Bool {
+            button.id == "tool_rectangle" || button.id == "undo"
+                || (button.id == "pin" && !buttons.contains(where: { $0.id == "undo" }))
         }
 
         static func totalWidth(_ buttons: [ScreenshotToolbarButton]) -> CGFloat {
-            CGFloat(buttons.count - 1) * gap + buttons.reduce(0) { $0 + buttonWidth($1) } + pad * 2
+            let separators = buttons.filter { hasSeparator(before: $0, in: buttons) }.count
+            return CGFloat(buttons.count - 1) * gap
+                + buttons.reduce(0) { $0 + buttonWidth($1) }
+                + CGFloat(separators) * separatorWidth
+                + pad * 2
         }
     }
 
@@ -1160,42 +1186,29 @@ private class OverlayView: NSView {
     private func drawArrow(_ annotation: AnnotationItem, in ctx: CGContext) {
         let start = imageToView(annotation.startPoint)
         let end = imageToView(annotation.endPoint)
-        let color = annotation.color
+        drawTaperedArrow(start: start, end: end, color: annotation.color, in: ctx)
+    }
 
-        let angle = atan2(end.y - start.y, end.x - start.x)
-        let len: CGFloat = 16
-        let spread: CGFloat = .pi / 8
+    private func drawTaperedArrow(
+        start: CGPoint,
+        end: CGPoint,
+        color: NSColor,
+        in ctx: CGContext
+    ) {
+        let points = ScreenshotAnnotationGeometry.taperedArrowPolygon(start: start, end: end)
+        guard let first = points.first else { return }
 
-        // Arrowhead points (base midpoint is len*cos(spread) before end)
-        let p1 = CGPoint(x: end.x - len * cos(angle - spread),
-                         y: end.y - len * sin(angle - spread))
-        let p2 = CGPoint(x: end.x - len * cos(angle + spread),
-                         y: end.y - len * sin(angle + spread))
-
-        // Line stops at arrowhead base
-        let inset = len * cos(spread)
-        let lineEnd = CGPoint(x: end.x - inset * cos(angle),
-                              y: end.y - inset * sin(angle))
+        let path = CGMutablePath()
+        path.move(to: first)
+        for point in points.dropFirst() {
+            path.addLine(to: point)
+        }
+        path.closeSubpath()
 
         ctx.saveGState()
-        ctx.setStrokeColor(color.cgColor)
-        ctx.setLineWidth(3)
-        ctx.setLineCap(.round)
-        ctx.setLineJoin(.round)
-        ctx.move(to: start)
-        ctx.addLine(to: lineEnd)
-        ctx.strokePath()
-
-        // Filled arrowhead
-        let path = CGMutablePath()
-        path.move(to: end)
-        path.addLine(to: p1)
-        path.addLine(to: p2)
-        path.closeSubpath()
         ctx.addPath(path)
         ctx.setFillColor(color.cgColor)
         ctx.fillPath()
-
         ctx.restoreGState()
     }
 
@@ -1377,6 +1390,102 @@ private class OverlayView: NSView {
 
     // MARK: - Toolbar Drawing
 
+    private func drawFlatToolbarBackground(_ rect: CGRect, context ctx: CGContext) {
+        let path = CGPath(
+            roundedRect: rect,
+            cornerWidth: ScreenshotToolbarMetrics.cornerRadius,
+            cornerHeight: ScreenshotToolbarMetrics.cornerRadius,
+            transform: nil
+        )
+        ctx.saveGState()
+        ctx.setShadow(
+            offset: CGSize(width: 0, height: -2),
+            blur: 8,
+            color: NSColor.black.withAlphaComponent(0.24).cgColor
+        )
+        ctx.addPath(path)
+        ctx.setFillColor(NSColor.white.withAlphaComponent(0.98).cgColor)
+        ctx.fillPath()
+        ctx.restoreGState()
+
+        ctx.saveGState()
+        ctx.addPath(path)
+        ctx.setStrokeColor(NSColor.black.withAlphaComponent(0.10).cgColor)
+        ctx.setLineWidth(ScreenshotToolbarMetrics.borderWidth)
+        ctx.strokePath()
+        ctx.restoreGState()
+    }
+
+    private func drawLongScreenshotGlyph(in rect: CGRect, context ctx: CGContext) {
+        let center = CGPoint(x: rect.midX, y: rect.midY)
+        let scale: CGFloat = 0.84
+
+        ctx.saveGState()
+        ctx.setStrokeColor(NSColor.black.cgColor)
+        ctx.setLineWidth(1.4)
+        ctx.setLineCap(.round)
+        ctx.setLineJoin(.round)
+
+        // Open capture frame at the top, matching the reference toolbar icon.
+        ctx.move(to: CGPoint(x: center.x - 9 * scale, y: center.y + 2 * scale))
+        ctx.addLine(to: CGPoint(x: center.x - 9 * scale, y: center.y + 10 * scale))
+        ctx.addLine(to: CGPoint(x: center.x + 9 * scale, y: center.y + 10 * scale))
+        ctx.addLine(to: CGPoint(x: center.x + 9 * scale, y: center.y + 2 * scale))
+        ctx.strokePath()
+
+        // Symmetric scissors below the frame.
+        let ringRadius: CGFloat = 3.1 * scale
+        let leftRing = CGPoint(x: center.x - 5.5 * scale, y: center.y - 6 * scale)
+        let rightRing = CGPoint(x: center.x + 5.5 * scale, y: center.y - 6 * scale)
+        ctx.strokeEllipse(in: CGRect(
+            x: leftRing.x - ringRadius, y: leftRing.y - ringRadius,
+            width: ringRadius * 2, height: ringRadius * 2
+        ))
+        ctx.strokeEllipse(in: CGRect(
+            x: rightRing.x - ringRadius, y: rightRing.y - ringRadius,
+            width: ringRadius * 2, height: ringRadius * 2
+        ))
+
+        let crossing = CGPoint(x: center.x, y: center.y - 1.5 * scale)
+        ctx.move(to: CGPoint(x: leftRing.x + 2.2 * scale, y: leftRing.y + 2.2 * scale))
+        ctx.addLine(to: crossing)
+        ctx.addLine(to: CGPoint(x: center.x + 6 * scale, y: center.y + 5.5 * scale))
+        ctx.move(to: CGPoint(x: rightRing.x - 2.2 * scale, y: rightRing.y + 2.2 * scale))
+        ctx.addLine(to: crossing)
+        ctx.addLine(to: CGPoint(x: center.x - 6 * scale, y: center.y + 5.5 * scale))
+        ctx.strokePath()
+        ctx.restoreGState()
+    }
+
+    private func drawAnnotateGlyph(in rect: CGRect, context ctx: CGContext) {
+        let center = CGPoint(x: rect.midX, y: rect.midY)
+
+        ctx.saveGState()
+        ctx.setStrokeColor(NSColor.black.cgColor)
+        ctx.setLineWidth(1.4)
+        ctx.setLineCap(.round)
+        ctx.setLineJoin(.round)
+
+        let pen = CGMutablePath()
+        pen.move(to: CGPoint(x: center.x - 9, y: center.y - 7))
+        pen.addLine(to: CGPoint(x: center.x - 7, y: center.y - 1))
+        pen.addLine(to: CGPoint(x: center.x + 4, y: center.y + 9))
+        pen.addLine(to: CGPoint(x: center.x + 8, y: center.y + 5))
+        pen.addLine(to: CGPoint(x: center.x - 2, y: center.y - 5))
+        pen.closeSubpath()
+        ctx.addPath(pen)
+        ctx.strokePath()
+
+        ctx.move(to: CGPoint(x: center.x + 2, y: center.y + 7))
+        ctx.addLine(to: CGPoint(x: center.x + 6, y: center.y + 3))
+        ctx.move(to: CGPoint(x: center.x - 7, y: center.y - 1))
+        ctx.addLine(to: CGPoint(x: center.x - 2, y: center.y - 5))
+        ctx.move(to: CGPoint(x: center.x - 9, y: center.y - 9))
+        ctx.addLine(to: CGPoint(x: center.x + 7, y: center.y - 9))
+        ctx.strokePath()
+        ctx.restoreGState()
+    }
+
     private func drawToolbar(_ ctx: CGContext) {
         let cr = captureRectLocal
         let buttons = ScreenshotToolbarConfiguration.buttons(
@@ -1395,51 +1504,77 @@ private class OverlayView: NSView {
         toolbarGlobalRect = CGRect(x: tX, y: tY, width: tW, height: tH)
         toolbarHitRects = [:]
 
-        // Background
-        let bg = NSBezierPath(roundedRect: toolbarGlobalRect, xRadius: 10, yRadius: 10)
-        NSColor.black.withAlphaComponent(0.82).setFill()
-        bg.fill()
-        ctx.setStrokeColor(NSColor.white.withAlphaComponent(0.15).cgColor)
-        ctx.setLineWidth(0.5)
-        bg.stroke()
+        drawFlatToolbarBackground(toolbarGlobalRect, context: ctx)
 
         var curX = tX + ToolbarLayout.pad
-        let whiteConfig = NSImage.SymbolConfiguration(paletteColors: [.white])
         for button in buttons {
-            let buttonHeight: CGFloat = 30
+            if ToolbarLayout.hasSeparator(before: button, in: buttons) {
+                let separatorX = curX + ToolbarLayout.separatorWidth / 2
+                ctx.setStrokeColor(NSColor.black.withAlphaComponent(0.12).cgColor)
+                ctx.setLineWidth(1)
+                ctx.move(to: CGPoint(x: separatorX, y: tY + 10))
+                ctx.addLine(to: CGPoint(x: separatorX, y: tY + tH - 10))
+                ctx.strokePath()
+                curX += ToolbarLayout.separatorWidth
+            }
+
+            let buttonHeight = ScreenshotToolbarMetrics.buttonSize
             let rect = CGRect(
                 x: curX, y: tY + (tH - buttonHeight) / 2,
                 width: ToolbarLayout.buttonWidth(button), height: buttonHeight
             )
             toolbarHitRects[button.id] = rect
 
-            let isSelectedTool = button.id.hasPrefix("tool_") &&
-                Int(button.id.dropFirst(5)) == currentTool.rawValue && !canMoveSelection
-            if button.isPrimary || isSelectedTool {
-                let fill = button.isPrimary ? NSColor.systemBlue : NSColor.white.withAlphaComponent(0.2)
-                fill.setFill()
-                NSBezierPath(roundedRect: rect, xRadius: 7, yRadius: 7).fill()
+            let isSelectedTool = AnnotationTool.toolbarTool(for: button.id) == currentTool
+                && !canMoveSelection
+            if isSelectedTool {
+                let selectedPath = NSBezierPath(roundedRect: rect, xRadius: 6, yRadius: 6)
+                NSColor.black.withAlphaComponent(0.09).setFill()
+                selectedPath.fill()
             }
 
-            if button.id == "color_picker" {
+            if button.id == "annotate" {
+                drawAnnotateGlyph(in: rect, context: ctx)
+            } else if button.id == "longscreenshot" {
+                drawLongScreenshotGlyph(in: rect, context: ctx)
+            } else if button.id == "color_picker" {
                 ctx.setFillColor(currentColor.cgColor)
-                ctx.fillEllipse(in: rect.insetBy(dx: 7, dy: 6))
-                ctx.setStrokeColor(NSColor.white.cgColor)
-                ctx.setLineWidth(1.5)
-                ctx.strokeEllipse(in: rect.insetBy(dx: 7, dy: 6))
+                ctx.fillEllipse(in: rect.insetBy(dx: 8, dy: 8))
+                ctx.setStrokeColor(NSColor.black.withAlphaComponent(0.78).cgColor)
+                ctx.setLineWidth(1.2)
+                ctx.strokeEllipse(in: rect.insetBy(dx: 8, dy: 8))
+            } else if button.id == "tool_text" {
+                let attributes: [NSAttributedString.Key: Any] = [
+                    .font: NSFont.systemFont(ofSize: 24, weight: .light),
+                    .foregroundColor: NSColor.black,
+                ]
+                let glyph = "A" as NSString
+                let size = glyph.size(withAttributes: attributes)
+                glyph.draw(
+                    at: CGPoint(x: rect.midX - size.width / 2, y: rect.midY - size.height / 2),
+                    withAttributes: attributes
+                )
             } else {
                 if !button.symbol.isEmpty {
-                    let iconSize: CGFloat = button.title == nil ? 17 : 15
-                    let iconX = button.title == nil ? rect.midX - iconSize / 2 : rect.minX + 9
+                    let iconSize = ScreenshotToolbarMetrics.iconPointSize + 1
+                    let iconX = rect.midX - iconSize / 2
                     let iconRect = CGRect(x: iconX, y: rect.midY - iconSize / 2,
                                           width: iconSize, height: iconSize)
+                    let iconColor: NSColor = button.id == "undo" && annotations.isEmpty
+                        ? NSColor.black.withAlphaComponent(0.24)
+                        : .black
+                    let symbolConfig = NSImage.SymbolConfiguration(
+                        pointSize: ScreenshotToolbarMetrics.iconPointSize,
+                        weight: .light
+                    )
+                        .applying(NSImage.SymbolConfiguration(paletteColors: [iconColor]))
                     NSImage(systemSymbolName: button.symbol, accessibilityDescription: button.title)?
-                        .withSymbolConfiguration(whiteConfig)?.draw(in: iconRect)
+                        .withSymbolConfiguration(symbolConfig)?.draw(in: iconRect)
                 }
                 if let title = button.title {
                     let attributes: [NSAttributedString.Key: Any] = [
-                        .font: NSFont.systemFont(ofSize: 12, weight: button.isPrimary ? .semibold : .medium),
-                        .foregroundColor: NSColor.white,
+                        .font: NSFont.systemFont(ofSize: 12, weight: .medium),
+                        .foregroundColor: NSColor.black,
                     ]
                     let text = title as NSString
                     let textSize = text.size(withAttributes: attributes)
@@ -1460,8 +1595,9 @@ private class OverlayView: NSView {
         let tips: [String: String] = [
             "annotate": "标注", "back": "返回截图", "more": "更多操作",
             "color_picker": "选择颜色",
-            "tool_0": "箭头", "tool_1": "文字", "tool_2": "编号",
-            "tool_3": "马赛克", "tool_4": "矩形", "tool_5": "椭圆", "tool_6": "高亮",
+            "tool_arrow": "箭头", "tool_text": "文字", "tool_number": "编号",
+            "tool_mosaic": "马赛克", "tool_rectangle": "矩形", "tool_ellipse": "椭圆",
+            "tool_highlight": "区域高亮",
             "undo": "撤销", "longscreenshot": "长截图", "save": "保存", "copy": "复制",
             "pin": "固定", "cancel": "取消",
         ]
@@ -2187,8 +2323,7 @@ private class OverlayView: NSView {
         }
 
         // Tool selection
-        if id.hasPrefix("tool_"), let raw = Int(id.replacingOccurrences(of: "tool_", with: "")),
-           let tool = AnnotationTool(rawValue: raw) {
+        if let tool = AnnotationTool.toolbarTool(for: id) {
             currentTool = tool
             canMoveSelection = false
             needsDisplay = true
@@ -2500,40 +2635,12 @@ private class OverlayView: NSView {
     private func drawAnnotationFixed(_ annotation: AnnotationItem, in ctx: CGContext, imageSize: CGSize) {
         switch annotation.tool {
         case .arrow:
-            let start = annotation.startPoint
-            let end = annotation.endPoint
-            let color = annotation.color
-
-            let angle = atan2(end.y - start.y, end.x - start.x)
-            let len: CGFloat = 16
-            let spread: CGFloat = .pi / 8
-
-            let p1 = CGPoint(x: end.x - len * cos(angle - spread),
-                             y: end.y - len * sin(angle - spread))
-            let p2 = CGPoint(x: end.x - len * cos(angle + spread),
-                             y: end.y - len * sin(angle + spread))
-            let inset = len * cos(spread)
-            let lineEnd = CGPoint(x: end.x - inset * cos(angle),
-                                  y: end.y - inset * sin(angle))
-
-            ctx.saveGState()
-            ctx.setStrokeColor(color.cgColor)
-            ctx.setLineWidth(3)
-            ctx.setLineCap(.round)
-            ctx.setLineJoin(.round)
-            ctx.move(to: start)
-            ctx.addLine(to: lineEnd)
-            ctx.strokePath()
-
-            let path = CGMutablePath()
-            path.move(to: end)
-            path.addLine(to: p1)
-            path.addLine(to: p2)
-            path.closeSubpath()
-            ctx.addPath(path)
-            ctx.setFillColor(color.cgColor)
-            ctx.fillPath()
-            ctx.restoreGState()
+            drawTaperedArrow(
+                start: annotation.startPoint,
+                end: annotation.endPoint,
+                color: annotation.color,
+                in: ctx
+            )
 
         case .text:
             let attrs: [NSAttributedString.Key: Any] = [

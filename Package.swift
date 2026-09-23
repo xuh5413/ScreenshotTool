@@ -19,7 +19,7 @@ let package = Package(
         .executableTarget(
             name: "ScreenshotTool",
             dependencies: ["LongScreenshotCore", "ScreenshotToolbarCore"],
-            exclude: ["Info.plist", "Entitlements.plist", "AppIcon.icns"]
+            exclude: ["Info.plist", "Entitlements.plist", "AppIcon.icns", "AppIconSource.png"]
         ),
         .executableTarget(
             name: "LongScreenshotCoreChecks",

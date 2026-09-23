@@ -34,6 +34,10 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.accessory)
+        if let iconURL = Bundle.main.url(forResource: "AppIcon", withExtension: "icns"),
+           let icon = NSImage(contentsOf: iconURL) {
+            NSApp.applicationIconImage = icon
+        }
         // Load saved hotkey first so menu displays the correct value
         setupHotkey()
         setupMenuBar()
@@ -42,10 +46,57 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
     // MARK: - Menu Bar
 
+    private func makeMenuBarIcon() -> NSImage {
+        let size = NSSize(width: 24, height: 18)
+        let image = NSImage(size: size, flipped: false) { rect in
+            NSColor.black.setStroke()
+            NSColor.black.setFill()
+
+            let corners = NSBezierPath()
+            corners.lineWidth = 1.7
+            corners.lineCapStyle = .round
+            corners.lineJoinStyle = .round
+            corners.move(to: CGPoint(x: 7, y: 3))
+            corners.line(to: CGPoint(x: 3, y: 3))
+            corners.line(to: CGPoint(x: 3, y: 7))
+            corners.move(to: CGPoint(x: 3, y: 11))
+            corners.line(to: CGPoint(x: 3, y: 15))
+            corners.line(to: CGPoint(x: 7, y: 15))
+            corners.move(to: CGPoint(x: 17, y: 15))
+            corners.line(to: CGPoint(x: 21, y: 15))
+            corners.line(to: CGPoint(x: 21, y: 11))
+            corners.move(to: CGPoint(x: 21, y: 7))
+            corners.line(to: CGPoint(x: 21, y: 3))
+            corners.line(to: CGPoint(x: 17, y: 3))
+            corners.stroke()
+
+            let mountain = NSBezierPath()
+            mountain.move(to: CGPoint(x: 5.5, y: 5))
+            mountain.line(to: CGPoint(x: 10, y: 10))
+            mountain.curve(
+                to: CGPoint(x: 12.4, y: 7.2),
+                controlPoint1: CGPoint(x: 10.5, y: 10.5),
+                controlPoint2: CGPoint(x: 11.4, y: 7.2)
+            )
+            mountain.curve(
+                to: CGPoint(x: 18.5, y: 5),
+                controlPoint1: CGPoint(x: 13.8, y: 8.8),
+                controlPoint2: CGPoint(x: 15.2, y: 8.5)
+            )
+            mountain.close()
+            mountain.fill()
+
+            NSBezierPath(ovalIn: CGRect(x: 15.7, y: 10.5, width: 2.6, height: 2.6)).fill()
+            return true
+        }
+        image.isTemplate = true
+        return image
+    }
+
     private func setupMenuBar() {
-        statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
-        statusItem.button?.image = NSImage(systemSymbolName: "camera.fill",
-                                           accessibilityDescription: "截图工具")
+        statusItem = NSStatusBar.system.statusItem(withLength: 28)
+        statusItem.button?.image = makeMenuBarIcon()
+        statusItem.button?.imageScaling = .scaleProportionallyDown
 
         let menu = NSMenu()
         captureMenuItem = NSMenuItem(title: "", action: #selector(startCapture), keyEquivalent: "")
@@ -257,13 +308,17 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             self.longScreenshotManager = nil
 
             DispatchQueue.main.async {
-                self.currentOverlay?.exitLongScreenshotMode()
                 switch action {
                 case .annotate:
+                    self.currentOverlay?.exitLongScreenshotMode()
                     self.showLongScreenshotResult(image: image, region: region)
                 case .copy:
                     self.copyLongScreenshot(image: image)
                 case .save:
+                    // The selection overlay sits above save panels. Dismiss it before
+                    // presenting a panel or starting the potentially slow PNG write.
+                    self.currentOverlay?.cleanupOverlay()
+                    self.currentOverlay = nil
                     self.saveLongScreenshot(image: image, region: region)
                 }
             }
@@ -273,7 +328,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             guard let self = self else { return }
             self.longScreenshotManager = nil
             DispatchQueue.main.async {
-                self.currentOverlay?.exitLongScreenshotMode()
+                self.currentOverlay?.cleanupOverlay()
+                self.currentOverlay = nil
                 self.showError("长截图失败: \(msg)")
             }
         }
@@ -327,22 +383,32 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func saveCGImage(_ cgImage: CGImage) {
-        let writePNG: (CGImage, URL) -> Void = { srcImage, url in
+        let writePNG: (CGImage, URL) -> Bool = { srcImage, url in
             let properties: [CFString: Any] = [
                 kCGImagePropertyDPIWidth: 72,
                 kCGImagePropertyDPIHeight: 72,
             ]
-            guard let destination = CGImageDestinationCreateWithURL(url as CFURL, UTType.png.identifier as CFString, 1, nil) else { return }
+            guard let destination = CGImageDestinationCreateWithURL(url as CFURL, UTType.png.identifier as CFString, 1, nil) else { return false }
             CGImageDestinationAddImage(destination, srcImage, properties as CFDictionary)
-            CGImageDestinationFinalize(destination)
+            return CGImageDestinationFinalize(destination)
+        }
+
+        let saveInBackground: (URL) -> Void = { [weak self] url in
+            DispatchQueue.global(qos: .userInitiated).async {
+                guard writePNG(cgImage, url) else {
+                    DispatchQueue.main.async {
+                        self?.showError("长截图保存失败")
+                    }
+                    return
+                }
+                NSLog("[ScreenshotTool] long screenshot saved: \(url.path)")
+            }
         }
 
         if let dir = defaultSavePath() {
             let filename = "长截图_\(formattedDate()).png"
             let url = dir.appendingPathComponent(filename)
-            writePNG(cgImage, url)
-            currentOverlay?.cleanupOverlay()
-            currentOverlay = nil
+            saveInBackground(url)
             return
         }
 
@@ -350,15 +416,9 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         panel.allowedContentTypes = [.png]
         panel.nameFieldStringValue = "长截图_\(formattedDate()).png"
 
-        panel.begin { [weak self] response in
-            guard response == .OK, let url = panel.url else {
-                self?.currentOverlay?.cleanupOverlay()
-                self?.currentOverlay = nil
-                return
-            }
-            writePNG(cgImage, url)
-            self?.currentOverlay?.cleanupOverlay()
-            self?.currentOverlay = nil
+        panel.begin { response in
+            guard response == .OK, let url = panel.url else { return }
+            saveInBackground(url)
         }
     }
 

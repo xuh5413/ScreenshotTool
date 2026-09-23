@@ -27,6 +27,10 @@ if [ -f "$PROJECT_DIR/Sources/ScreenshotTool/AppIcon.icns" ]; then
     cp "$PROJECT_DIR/Sources/ScreenshotTool/AppIcon.icns" "$APP_BUNDLE/Contents/Resources/"
 fi
 
+# Seal the executable and bundled icon together so replacing the artwork does
+# not leave the app with a stale resource signature.
+codesign --force --deep --sign - "$APP_BUNDLE"
+
 # Note: com.apple.developer.screen-capture entitlement requires a real Apple Developer
 # certificate for signing. Without it, ScreenCaptureKit still prompts for Screen
 # Recording permission via TCC on first use.
