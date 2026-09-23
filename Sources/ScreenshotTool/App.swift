@@ -1,5 +1,6 @@
 import Cocoa
 import Carbon
+import ClipboardHistoryAppKit
 import ScreenCaptureKit
 import ServiceManagement
 import UniformTypeIdentifiers
@@ -7,15 +8,18 @@ import UniformTypeIdentifiers
 // MARK: - App Entry Point
 
 @main
+@MainActor
 class AppDelegate: NSObject, NSApplicationDelegate {
 
     private var statusItem: NSStatusItem!
     private var captureMenuItem: NSMenuItem!
+    private var clipboardHistoryMenuItem: NSMenuItem!
     private var savePathMenuItem: NSMenuItem!
     private var currentOverlay: CaptureOverlay?
     private var pinManager: PinManager?
     private var activeHotkeyConfig: HotkeyConfigWindow?
     private var longScreenshotManager: LongScreenshotManager?
+    private var clipboardHistoryCoordinator: ClipboardHistoryCoordinator?
 
     // MARK: - Lifecycle
 
@@ -42,6 +46,12 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         setupHotkey()
         setupMenuBar()
         pinManager = PinManager()
+        startClipboardHistory()
+    }
+
+    func applicationWillTerminate(_ notification: Notification) {
+        clipboardHistoryCoordinator?.shutdown()
+        HotkeyManager.shared.unregister()
     }
 
     // MARK: - Menu Bar
@@ -102,6 +112,15 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         captureMenuItem = NSMenuItem(title: "", action: #selector(startCapture), keyEquivalent: "")
         updateCaptureMenuItemTitle()
         menu.addItem(captureMenuItem)
+        clipboardHistoryMenuItem = NSMenuItem(
+            title: "剪贴板历史… (⌘⇧V)",
+            action: #selector(showClipboardHistory),
+            keyEquivalent: ""
+        )
+        clipboardHistoryMenuItem.target = self
+        clipboardHistoryMenuItem.isEnabled = false
+        clipboardHistoryMenuItem.toolTip = "剪贴板历史正在启动"
+        menu.addItem(clipboardHistoryMenuItem)
         let hotkeyItem = NSMenuItem(title: "设置快捷键...", action: #selector(showHotkeyConfig), keyEquivalent: "")
         hotkeyItem.target = self
         menu.addItem(hotkeyItem)
@@ -119,6 +138,31 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func updateCaptureMenuItemTitle() {
         captureMenuItem.title = "截图 (\(HotkeyManager.shared.currentHotkeyString()))"
+    }
+
+    private func startClipboardHistory() {
+        let coordinator = ClipboardHistoryCoordinator()
+        clipboardHistoryCoordinator = coordinator
+        Task { @MainActor [weak self, weak coordinator] in
+            guard let self, let coordinator else { return }
+            do {
+                try await coordinator.start()
+                clipboardHistoryMenuItem.isEnabled = true
+                if coordinator.hotkeyAvailable {
+                    clipboardHistoryMenuItem.toolTip = "打开剪贴板历史"
+                } else {
+                    clipboardHistoryMenuItem.toolTip = "⌘⇧V 注册失败，可从菜单打开"
+                }
+            } catch {
+                clipboardHistoryMenuItem.isEnabled = false
+                clipboardHistoryMenuItem.toolTip = "剪贴板历史初始化失败"
+                NSLog("[ScreenshotTool] clipboard history unavailable: \(error)")
+            }
+        }
+    }
+
+    @objc private func showClipboardHistory() {
+        clipboardHistoryCoordinator?.showPanel()
     }
 
     // MARK: - Save Path

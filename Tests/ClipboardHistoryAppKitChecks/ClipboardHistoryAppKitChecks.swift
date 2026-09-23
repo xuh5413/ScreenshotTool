@@ -12,7 +12,29 @@ struct ClipboardHistoryAppKitChecks {
         try checkPasteboardRestore(source: source)
         try await checkMonitorSuppressionAndPriority(source: source)
         checkPanelStateAndPreview()
+        await checkHotkeyRoutingAndStartupIsolation()
         print("✅ ClipboardHistoryAppKitChecks passed")
+    }
+
+    private static func checkHotkeyRoutingAndStartupIsolation() async {
+        var fired = false
+        let router = ClipboardHotkeyActionRouter(expectedID: 2) { fired = true }
+        router.handle(id: 1)
+        expect(!fired, "screenshot hotkey ID must not trigger clipboard history")
+        router.handle(id: 2)
+        expect(fired, "clipboard hotkey ID must trigger clipboard history")
+
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("clipboard-startup-check-\(UUID().uuidString)", isDirectory: true)
+        let result = await ClipboardHistoryStartup.start(rootURL: root) { _, _ in
+            throw ClipboardStoreError.openFailed("fixture")
+        }
+        switch result {
+        case .available:
+            fatalError("❌ failed database startup must not create an available runtime")
+        case .unavailable(let message):
+            expect(message.contains("fixture"), "startup failure must preserve the database error")
+        }
     }
 
     private static func checkPanelStateAndPreview() {

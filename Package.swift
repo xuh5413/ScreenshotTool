@@ -29,7 +29,12 @@ let package = Package(
         ),
         .executableTarget(
             name: "ScreenshotTool",
-            dependencies: ["LongScreenshotCore", "ScreenshotToolbarCore"],
+            dependencies: [
+                "LongScreenshotCore",
+                "ScreenshotToolbarCore",
+                "ClipboardHistoryCore",
+                "ClipboardHistoryAppKit"
+            ],
             exclude: ["Info.plist", "Entitlements.plist", "AppIcon.icns", "AppIconSource.png"]
         ),
         .executableTarget(
