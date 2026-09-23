@@ -18,6 +18,10 @@ let package = Package(
             dependencies: ["CSQLite"]
         ),
         .target(
+            name: "ClipboardHistoryAppKit",
+            dependencies: ["ClipboardHistoryCore"]
+        ),
+        .target(
             name: "LongScreenshotCore"
         ),
         .target(
@@ -47,6 +51,11 @@ let package = Package(
             name: "ClipboardHistoryCoreChecks",
             dependencies: ["ClipboardHistoryCore"],
             path: "Tests/ClipboardHistoryCoreChecks"
+        ),
+        .executableTarget(
+            name: "ClipboardHistoryAppKitChecks",
+            dependencies: ["ClipboardHistoryCore", "ClipboardHistoryAppKit"],
+            path: "Tests/ClipboardHistoryAppKitChecks"
         )
     ]
 )
