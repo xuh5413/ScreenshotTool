@@ -10,6 +10,13 @@ let package = Package(
         .executable(name: "ScreenshotTool", targets: ["ScreenshotTool"])
     ],
     targets: [
+        .systemLibrary(
+            name: "CSQLite"
+        ),
+        .target(
+            name: "ClipboardHistoryCore",
+            dependencies: ["CSQLite"]
+        ),
         .target(
             name: "LongScreenshotCore"
         ),
@@ -35,6 +42,11 @@ let package = Package(
             name: "ScreenshotToolbarChecks",
             dependencies: ["ScreenshotToolbarCore"],
             path: "Tests/ScreenshotToolbarChecks"
+        ),
+        .executableTarget(
+            name: "ClipboardHistoryCoreChecks",
+            dependencies: ["ClipboardHistoryCore"],
+            path: "Tests/ClipboardHistoryCoreChecks"
         )
     ]
 )
