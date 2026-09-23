@@ -11,7 +11,42 @@ struct ClipboardHistoryAppKitChecks {
         try checkPasteboardDecoding(source: source)
         try checkPasteboardRestore(source: source)
         try await checkMonitorSuppressionAndPriority(source: source)
+        checkPanelStateAndPreview()
         print("✅ ClipboardHistoryAppKitChecks passed")
+    }
+
+    private static func checkPanelStateAndPreview() {
+        let textItem = makeItem(kind: .text, plainText: "first")
+        let imageItem = makeItem(kind: .image, plainText: "图片", assetPath: "image.png")
+        let fileURL = URL(fileURLWithPath: "/definitely-missing/clipboard-history-file")
+        let fileItem = makeItem(kind: .files, plainText: "file", fileURLs: [fileURL])
+
+        var state = ClipboardPanelState(items: [textItem, imageItem, fileItem])
+        expect(state.selectedID == textItem.id, "first item must be selected")
+        state.moveSelection(by: 1)
+        expect(state.selectedID == imageItem.id, "down navigation must advance")
+        state.moveSelection(by: 10)
+        expect(state.selectedID == fileItem.id, "selection must clamp at the end")
+        state.apply(items: [fileItem], preservingSelection: true)
+        expect(state.selectedID == fileItem.id, "reload must keep an available selection")
+        state.apply(items: [], preservingSelection: true)
+        expect(state.selectedID == nil, "empty results must clear selection")
+
+        expect(
+            ClipboardPreviewModel(item: imageItem, imageData: nil, fileExists: { _ in false })
+                == .unavailable("图片资源不存在"),
+            "missing image data must produce an unavailable preview"
+        )
+        expect(
+            ClipboardPreviewModel(item: fileItem, imageData: nil, fileExists: { _ in false })
+                == .unavailable("文件不存在"),
+            "missing files must produce an unavailable preview"
+        )
+        expect(
+            ClipboardPreviewModel(item: textItem, imageData: nil, fileExists: { _ in false })
+                == .text("first"),
+            "text preview must retain the full string"
+        )
     }
 
     private static func checkPasteboardDecoding(source: ClipboardSource) throws {

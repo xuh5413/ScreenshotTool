@@ -5,6 +5,7 @@ import Foundation
 @MainActor
 public final class ClipboardMonitor {
     public var onHistoryChanged: (@MainActor () -> Void)?
+    public var onError: (@MainActor (Error) -> Void)?
 
     private let pasteboard: NSPasteboard
     private let store: ClipboardStore
@@ -87,6 +88,7 @@ public final class ClipboardMonitor {
             onHistoryChanged?()
         } catch {
             NSLog("[ScreenshotTool] clipboard item skipped: \(error)")
+            onError?(error)
         }
     }
 }
