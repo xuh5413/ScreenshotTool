@@ -3,7 +3,7 @@ import ClipboardHistoryCore
 
 @main
 struct ClipboardHistoryCoreChecks {
-    static func main() throws {
+    static func main() async throws {
         let source = ClipboardSource(appName: "Notes", bundleID: "com.apple.Notes")
         let first = ClipboardCandidate(
             payload: .text("hello\r\nworld"),
@@ -46,7 +46,149 @@ struct ClipboardHistoryCoreChecks {
         expectThrowsEmptyContent()
         checkPrivacyPolicy()
         checkRetentionPolicy()
+        try await checkClipboardStore(source: source, first: first, second: second)
         print("✅ ClipboardHistoryCoreChecks passed")
+    }
+
+    private static func checkClipboardStore(
+        source: ClipboardSource,
+        first: ClipboardCandidate,
+        second: ClipboardCandidate
+    ) async throws {
+        let fileManager = FileManager.default
+        let root = fileManager.temporaryDirectory
+            .appendingPathComponent("clipboard-store-check-\(UUID().uuidString)", isDirectory: true)
+        defer { try? fileManager.removeItem(at: root) }
+
+        let databaseURL = root.appendingPathComponent("history.sqlite")
+        let assetsURL = root.appendingPathComponent("assets", isDirectory: true)
+        try fileManager.createDirectory(at: assetsURL, withIntermediateDirectories: true)
+        let orphanURL = assetsURL.appendingPathComponent("orphan.png")
+        try Data([1, 2, 3]).write(to: orphanURL)
+
+        let store = ClipboardStore(databaseURL: databaseURL, assetsDirectoryURL: assetsURL)
+        try await store.open()
+        expect(!fileManager.fileExists(atPath: orphanURL.path), "opening the store must remove orphan image assets")
+
+        let firstStored = try await store.upsert(
+            try ClipboardContentNormalizer.normalized(candidate: first)
+        )
+        let duplicateStored = try await store.upsert(
+            try ClipboardContentNormalizer.normalized(candidate: second)
+        )
+        expect(firstStored.id == duplicateStored.id, "duplicates must update one row")
+        expect(
+            duplicateStored.createdAt == firstStored.createdAt && duplicateStored.updatedAt == second.capturedAt,
+            "duplicate updates must retain creation time and move the item to the new time"
+        )
+        let textMatches = try await store.query(.init(searchText: "world"))
+        expect(textMatches.count == 1, "search must match stored text")
+
+        try await store.setFavorite(id: firstStored.id, isFavorite: true)
+        let favoriteMatches = try await store.query(.init(filter: .favorites))
+        expect(favoriteMatches.map(\.id) == [firstStored.id], "favorites filter must return the toggled item")
+
+        let link = try await store.upsert(try ClipboardContentNormalizer.normalized(candidate: .init(
+            payload: .link(URL(string: "https://example.com/docs")!),
+            source: ClipboardSource(appName: "Browser", bundleID: "com.example.browser"),
+            capturedAt: Date(timeIntervalSince1970: 2.5)
+        )))
+        let textFilterMatches = try await store.query(.init(filter: .text))
+        expect(
+            Set(textFilterMatches.map(\.id)) == Set([firstStored.id, link.id]),
+            "text filter must include both plain text and links"
+        )
+        let sourceMatches = try await store.query(.init(searchText: "Browser"))
+        expect(sourceMatches.map(\.id) == [link.id], "search must match the source application name")
+
+        let imageData = Data([0x89, 0x50, 0x4E, 0x47])
+        let image = try await store.upsert(try ClipboardContentNormalizer.normalized(candidate: .init(
+            payload: .imagePNG(imageData),
+            source: source,
+            capturedAt: Date(timeIntervalSince1970: 3)
+        )))
+        let roundTripImageData = try await store.assetData(for: image)
+        expect(roundTripImageData == imageData, "image asset must round-trip")
+        try await store.markRestored(id: image.id, at: Date(timeIntervalSince1970: 4))
+        let imageMatches = try await store.query(.init(filter: .image))
+        expect(imageMatches.first?.lastRestoredAt == Date(timeIntervalSince1970: 4), "restore time must persist")
+
+        try await store.delete(id: image.id)
+        let deletedImageData = try await store.assetData(for: image)
+        expect(deletedImageData == nil, "deleting an image must remove its asset")
+
+        let missing = try await store.upsert(try ClipboardContentNormalizer.normalized(candidate: .init(
+            payload: .imagePNG(Data([7, 8, 9])),
+            source: source,
+            capturedAt: Date(timeIntervalSince1970: 5)
+        )))
+        if let assetPath = missing.assetPath {
+            try fileManager.removeItem(at: assetsURL.appendingPathComponent(assetPath))
+        }
+        let missingImageData = try await store.assetData(for: missing)
+        expect(missingImageData == nil, "missing image assets must return nil")
+        let rowAfterMissingAsset = try await store.query(.init(filter: .image))
+        expect(rowAfterMissingAsset.contains(where: { $0.id == missing.id }), "missing assets must not delete metadata")
+
+        try await store.clear()
+        let clearedItems = try await store.query()
+        expect(clearedItems.isEmpty, "clear must remove every database row")
+
+        try await checkStoreCapacity(source: source)
+        try await checkCorruptedDatabaseIsolation()
+    }
+
+    private static func checkStoreCapacity(source: ClipboardSource) async throws {
+        let fileManager = FileManager.default
+        let root = fileManager.temporaryDirectory
+            .appendingPathComponent("clipboard-capacity-check-\(UUID().uuidString)", isDirectory: true)
+        defer { try? fileManager.removeItem(at: root) }
+        let policy = ClipboardRetentionPolicy(maxCount: 500, maxAge: 2_592_000, maxAssetBytes: 10)
+        let store = ClipboardStore(
+            databaseURL: root.appendingPathComponent("history.sqlite"),
+            assetsDirectoryURL: root.appendingPathComponent("assets"),
+            retentionPolicy: policy
+        )
+        try await store.open()
+        let favorite = try await store.upsert(try ClipboardContentNormalizer.normalized(candidate: .init(
+            payload: .imagePNG(Data(repeating: 1, count: 8)),
+            source: source,
+            capturedAt: .now
+        )))
+        try await store.setFavorite(id: favorite.id, isFavorite: true)
+
+        do {
+            _ = try await store.upsert(try ClipboardContentNormalizer.normalized(candidate: .init(
+                payload: .imagePNG(Data(repeating: 2, count: 4)),
+                source: source,
+                capturedAt: .now
+            )))
+            fatalError("❌ image admission must fail when favorite assets consume capacity")
+        } catch ClipboardStoreError.assetCapacityExceeded {
+            // Expected.
+        }
+        let capacityItems = try await store.query()
+        expect(capacityItems.count == 1, "capacity rejection must not create a database row")
+    }
+
+    private static func checkCorruptedDatabaseIsolation() async throws {
+        let fileManager = FileManager.default
+        let root = fileManager.temporaryDirectory
+            .appendingPathComponent("clipboard-corrupt-check-\(UUID().uuidString)", isDirectory: true)
+        defer { try? fileManager.removeItem(at: root) }
+        try fileManager.createDirectory(at: root, withIntermediateDirectories: true)
+        let databaseDirectory = root.appendingPathComponent("history.sqlite", isDirectory: true)
+        try fileManager.createDirectory(at: databaseDirectory, withIntermediateDirectories: true)
+        let store = ClipboardStore(
+            databaseURL: databaseDirectory,
+            assetsDirectoryURL: root.appendingPathComponent("assets")
+        )
+        do {
+            try await store.open()
+            fatalError("❌ a directory database path must fail to open")
+        } catch ClipboardStoreError.openFailed {
+            // Expected.
+        }
     }
 
     private static func checkPrivacyPolicy() {
