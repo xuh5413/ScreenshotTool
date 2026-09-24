@@ -7,4 +7,6 @@
 *.module
 *.pcm
 截图工具.app/
+SnipKeep.app/
 .claude/
+.idea/

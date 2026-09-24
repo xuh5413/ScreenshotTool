@@ -1,5 +1,6 @@
 import Cocoa
 import Carbon
+import ClipboardHistoryAppKit
 
 final class HotkeyManager {
 
@@ -11,7 +12,7 @@ final class HotkeyManager {
     private var eventHandler: EventHandlerRef?
     private let hotKeyID = EventHotKeyID(signature: 0x5352544C, id: 1)
 
-    private var action: (() -> Void)?
+    private var router: ClipboardHotkeyActionRouter?
     private(set) var currentKeyCode: UInt32 = 0x17
     private(set) var currentModifiers: UInt32 = UInt32(optionKey | shiftKey)
 
@@ -19,7 +20,11 @@ final class HotkeyManager {
 
     /// Register from stored preferences, falling back to defaults
     func register(action: @escaping () -> Void) -> Bool {
-        self.action = action
+        router = ClipboardHotkeyActionRouter(
+            expectedSignature: hotKeyID.signature,
+            expectedID: hotKeyID.id,
+            action: action
+        )
 
         let savedKey = UserDefaults.standard.object(forKey: Self.defaultsKeyCode) as? UInt32
         let savedMod = UserDefaults.standard.object(forKey: Self.defaultsModifiers) as? UInt32
@@ -57,7 +62,7 @@ final class HotkeyManager {
             RemoveEventHandler(handler)
             eventHandler = nil
         }
-        action = nil
+        router = nil
     }
 
     /// Convert NSEvent.ModifierFlags to Carbon modifier flags
@@ -99,7 +104,7 @@ final class HotkeyManager {
 
         let unmanaged = Unmanaged.passUnretained(self)
         let callback: EventHandlerProcPtr = { _, event, userData in
-            guard let userData = userData else { return noErr }
+            guard let event, let userData else { return OSStatus(eventNotHandledErr) }
             let manager = Unmanaged<HotkeyManager>.fromOpaque(userData).takeUnretainedValue()
 
             var hkID = EventHotKeyID()
@@ -112,10 +117,10 @@ final class HotkeyManager {
                 nil,
                 &hkID
             )
-            if err == noErr, hkID.id == 1 {
-                manager.action?()
-            }
-            return noErr
+            guard err == noErr else { return OSStatus(eventNotHandledErr) }
+            return manager.router?.handle(signature: hkID.signature, id: hkID.id) == true
+                ? OSStatus(noErr)
+                : OSStatus(eventNotHandledErr)
         }
 
         let result = InstallEventHandler(

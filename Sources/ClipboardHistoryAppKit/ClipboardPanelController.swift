@@ -16,25 +16,19 @@ public final class ClipboardPanelController: NSObject {
         target: nil,
         action: nil
     )
-    private let closeButton = NSButton()
+    private let clearButton = NSButton()
     private let tableView = ClipboardHistoryTableView()
     private let emptyLabel = NSTextField(labelWithString: "暂无剪贴板历史")
-    private let previewTitle = NSTextField(labelWithString: "预览")
-    private let previewTextView = NSTextView()
-    private let previewTextScroll = NSScrollView()
-    private let previewImageView = NSImageView()
-    private let previewPlaceholder = NSTextField(wrappingLabelWithString: "选择一条记录查看内容")
-    private let copyButton = NSButton(title: "复制", target: nil, action: nil)
     private let errorLabel = NSTextField(wrappingLabelWithString: "")
+    private let thumbnailLoader = ClipboardThumbnailLoader()
 
     private var state = ClipboardPanelState()
     private var debounceWorkItem: DispatchWorkItem?
     private var eventMonitor: Any?
     private var resignObserver: NSObjectProtocol?
-    private var queryGeneration = 0
-    private var previewGeneration = 0
+    private var reloadGate = ClipboardReloadGate()
     private var isContextMenuTracking = false
-    private var isExpanded = false
+    private var isClearConfirmationPresented = false
 
     public init(
         store: ClipboardStore,
@@ -45,7 +39,7 @@ public final class ClipboardPanelController: NSObject {
         self.monitor = monitor
         self.pasteboard = pasteboard
         panel = ClipboardHistoryPanel(
-            contentRect: NSRect(x: 0, y: 0, width: 640, height: 440),
+            contentRect: NSRect(origin: .zero, size: ClipboardPanelLayout.defaultSize),
             styleMask: [.borderless, .fullSizeContentView],
             backing: .buffered,
             defer: false
@@ -88,6 +82,10 @@ public final class ClipboardPanelController: NSObject {
         debounceWorkItem?.cancel()
         debounceWorkItem = nil
         removeEventMonitor()
+        if let attachedSheet = panel.attachedSheet {
+            panel.endSheet(attachedSheet, returnCode: .alertFirstButtonReturn)
+        }
+        isClearConfirmationPresented = false
         panel.orderOut(nil)
     }
 
@@ -96,9 +94,12 @@ public final class ClipboardPanelController: NSObject {
     }
 
     public func reload() {
+        performReload(hideErrorOnSuccess: true)
+    }
+
+    private func performReload(hideErrorOnSuccess: Bool) {
         debounceWorkItem?.cancel()
-        queryGeneration += 1
-        let generation = queryGeneration
+        guard let generation = reloadGate.beginReload() else { return }
         let query = ClipboardQuery(
             searchText: searchField.stringValue,
             filter: selectedFilter,
@@ -109,13 +110,20 @@ public final class ClipboardPanelController: NSObject {
             guard let self else { return }
             do {
                 let items = try await store.query(query)
-                guard generation == queryGeneration else { return }
-                state.apply(items: items, preservingSelection: true)
+                let hasAnyHistory = try await !store.query(.init(limit: 1)).isEmpty
+                guard reloadGate.accepts(generation) else { return }
+                state.apply(
+                    items: items,
+                    hasAnyHistory: hasAnyHistory,
+                    preservingSelection: true
+                )
                 tableView.reloadData()
                 synchronizeSelection()
-                updatePreview()
-                hideError()
+                if hideErrorOnSuccess {
+                    hideError()
+                }
             } catch {
+                guard reloadGate.accepts(generation) else { return }
                 showError(error)
             }
         }
@@ -134,12 +142,8 @@ public final class ClipboardPanelController: NSObject {
     private func configurePanel() {
         panel.title = "剪贴板历史"
         panel.level = .floating
-        panel.isOpaque = false
-        panel.backgroundColor = .clear
-        panel.hasShadow = true
         panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
         panel.isReleasedWhenClosed = false
-        panel.animationBehavior = .utilityWindow
 
         resignObserver = NotificationCenter.default.addObserver(
             forName: NSWindow.didResignKeyNotification,
@@ -147,7 +151,9 @@ public final class ClipboardPanelController: NSObject {
             queue: .main
         ) { [weak self] _ in
             Task { @MainActor [weak self] in
-                guard let self, !isContextMenuTracking else { return }
+                guard let self,
+                      !isContextMenuTracking,
+                      !isClearConfirmationPresented else { return }
                 close()
             }
         }
@@ -155,68 +161,39 @@ public final class ClipboardPanelController: NSObject {
 
     private func buildInterface() {
         let root = NSVisualEffectView()
-        root.material = .popover
-        root.blendingMode = .behindWindow
-        root.state = .active
-        root.wantsLayer = true
-        root.layer?.cornerRadius = 14
-        root.layer?.masksToBounds = true
+        ClipboardPanelStyling.apply(to: panel, root: root)
         panel.contentView = root
 
         searchField.placeholderString = "搜索剪贴板历史"
         searchField.sendsSearchStringImmediately = true
         searchField.translatesAutoresizingMaskIntoConstraints = false
 
-        filterControl.selectedSegment = 0
-        filterControl.segmentStyle = .rounded
-        filterControl.controlSize = .small
+        ClipboardFilterControlStyling.apply(to: filterControl)
         filterControl.translatesAutoresizingMaskIntoConstraints = false
 
-        closeButton.image = NSImage(systemSymbolName: "xmark", accessibilityDescription: "关闭")
-        closeButton.isBordered = false
-        closeButton.bezelStyle = .inline
-        closeButton.toolTip = "关闭"
-        closeButton.translatesAutoresizingMaskIntoConstraints = false
+        ClipboardClearHistoryPresentation.apply(to: clearButton)
+        clearButton.translatesAutoresizingMaskIntoConstraints = false
 
-        let topRow = NSStackView(views: [searchField, filterControl, closeButton])
+        let topRow = NSStackView(views: [searchField, filterControl, clearButton])
         topRow.orientation = .horizontal
         topRow.alignment = .centerY
         topRow.spacing = 10
         topRow.translatesAutoresizingMaskIntoConstraints = false
         searchField.setContentHuggingPriority(.defaultLow, for: .horizontal)
         filterControl.setContentHuggingPriority(.required, for: .horizontal)
+        clearButton.setContentHuggingPriority(.required, for: .horizontal)
 
         let divider = NSBox()
         divider.boxType = .separator
         divider.translatesAutoresizingMaskIntoConstraints = false
 
         let listContainer = buildListContainer()
-        let previewContainer = buildPreviewContainer()
-        let verticalDivider = NSBox()
-        verticalDivider.boxType = .separator
-        verticalDivider.translatesAutoresizingMaskIntoConstraints = false
-        NSLayoutConstraint.activate([
-            verticalDivider.widthAnchor.constraint(equalToConstant: 1),
-            listContainer.widthAnchor.constraint(equalToConstant: 360)
-        ])
-
-        let contentRow = NSStackView(views: [listContainer, verticalDivider, previewContainer])
-        contentRow.orientation = .horizontal
-        contentRow.alignment = .top
-        contentRow.spacing = 10
-        contentRow.distribution = .fill
-        contentRow.translatesAutoresizingMaskIntoConstraints = false
-        NSLayoutConstraint.activate([
-            listContainer.heightAnchor.constraint(equalTo: contentRow.heightAnchor),
-            verticalDivider.heightAnchor.constraint(equalTo: contentRow.heightAnchor),
-            previewContainer.heightAnchor.constraint(equalTo: contentRow.heightAnchor)
-        ])
 
         errorLabel.textColor = .systemRed
         errorLabel.font = .systemFont(ofSize: 11)
         errorLabel.isHidden = true
 
-        let rootStack = NSStackView(views: [topRow, divider, contentRow, errorLabel])
+        let rootStack = NSStackView(views: [topRow, divider, listContainer, errorLabel])
         rootStack.orientation = .vertical
         rootStack.alignment = .leading
         rootStack.spacing = 10
@@ -230,11 +207,13 @@ public final class ClipboardPanelController: NSObject {
             rootStack.bottomAnchor.constraint(equalTo: root.bottomAnchor, constant: -14),
             topRow.widthAnchor.constraint(equalTo: rootStack.widthAnchor),
             divider.widthAnchor.constraint(equalTo: rootStack.widthAnchor),
-            contentRow.widthAnchor.constraint(equalTo: rootStack.widthAnchor),
-            contentRow.heightAnchor.constraint(greaterThanOrEqualToConstant: 330),
+            listContainer.widthAnchor.constraint(equalTo: rootStack.widthAnchor),
+            listContainer.heightAnchor.constraint(
+                greaterThanOrEqualToConstant: ClipboardPanelLayout.minimumListHeight
+            ),
             errorLabel.widthAnchor.constraint(equalTo: rootStack.widthAnchor),
-            closeButton.widthAnchor.constraint(equalToConstant: 24),
-            closeButton.heightAnchor.constraint(equalToConstant: 24)
+            clearButton.widthAnchor.constraint(equalToConstant: 26),
+            clearButton.heightAnchor.constraint(equalToConstant: 24)
         ])
     }
 
@@ -277,87 +256,17 @@ public final class ClipboardPanelController: NSObject {
         return container
     }
 
-    private func buildPreviewContainer() -> NSView {
-        let container = NSView()
-        container.translatesAutoresizingMaskIntoConstraints = false
-
-        previewTitle.font = .systemFont(ofSize: 13, weight: .semibold)
-        previewTitle.translatesAutoresizingMaskIntoConstraints = false
-        container.addSubview(previewTitle)
-
-        let previewBody = NSView()
-        previewBody.wantsLayer = true
-        previewBody.layer?.cornerRadius = 8
-        previewBody.layer?.backgroundColor = NSColor.controlBackgroundColor.withAlphaComponent(0.55).cgColor
-        previewBody.translatesAutoresizingMaskIntoConstraints = false
-        container.addSubview(previewBody)
-
-        previewTextView.isEditable = false
-        previewTextView.isSelectable = true
-        previewTextView.drawsBackground = false
-        previewTextView.font = .systemFont(ofSize: 13)
-        previewTextView.textContainerInset = NSSize(width: 8, height: 8)
-        previewTextScroll.documentView = previewTextView
-        previewTextScroll.hasVerticalScroller = true
-        previewTextScroll.drawsBackground = false
-        previewTextScroll.translatesAutoresizingMaskIntoConstraints = false
-        previewBody.addSubview(previewTextScroll)
-
-        previewImageView.imageScaling = .scaleProportionallyUpOrDown
-        previewImageView.translatesAutoresizingMaskIntoConstraints = false
-        previewBody.addSubview(previewImageView)
-
-        previewPlaceholder.textColor = .secondaryLabelColor
-        previewPlaceholder.alignment = .center
-        previewPlaceholder.translatesAutoresizingMaskIntoConstraints = false
-        previewBody.addSubview(previewPlaceholder)
-
-        copyButton.bezelStyle = .rounded
-        copyButton.keyEquivalent = "\r"
-        copyButton.translatesAutoresizingMaskIntoConstraints = false
-        container.addSubview(copyButton)
-
-        NSLayoutConstraint.activate([
-            previewTitle.leadingAnchor.constraint(equalTo: container.leadingAnchor),
-            previewTitle.trailingAnchor.constraint(equalTo: container.trailingAnchor),
-            previewTitle.topAnchor.constraint(equalTo: container.topAnchor),
-            previewBody.leadingAnchor.constraint(equalTo: container.leadingAnchor),
-            previewBody.trailingAnchor.constraint(equalTo: container.trailingAnchor),
-            previewBody.topAnchor.constraint(equalTo: previewTitle.bottomAnchor, constant: 8),
-            previewBody.bottomAnchor.constraint(equalTo: copyButton.topAnchor, constant: -10),
-            copyButton.trailingAnchor.constraint(equalTo: container.trailingAnchor),
-            copyButton.bottomAnchor.constraint(equalTo: container.bottomAnchor),
-            copyButton.widthAnchor.constraint(greaterThanOrEqualToConstant: 76),
-
-            previewTextScroll.leadingAnchor.constraint(equalTo: previewBody.leadingAnchor),
-            previewTextScroll.trailingAnchor.constraint(equalTo: previewBody.trailingAnchor),
-            previewTextScroll.topAnchor.constraint(equalTo: previewBody.topAnchor),
-            previewTextScroll.bottomAnchor.constraint(equalTo: previewBody.bottomAnchor),
-            previewImageView.leadingAnchor.constraint(equalTo: previewBody.leadingAnchor, constant: 8),
-            previewImageView.trailingAnchor.constraint(equalTo: previewBody.trailingAnchor, constant: -8),
-            previewImageView.topAnchor.constraint(equalTo: previewBody.topAnchor, constant: 8),
-            previewImageView.bottomAnchor.constraint(equalTo: previewBody.bottomAnchor, constant: -8),
-            previewPlaceholder.leadingAnchor.constraint(equalTo: previewBody.leadingAnchor, constant: 10),
-            previewPlaceholder.trailingAnchor.constraint(equalTo: previewBody.trailingAnchor, constant: -10),
-            previewPlaceholder.centerYAnchor.constraint(equalTo: previewBody.centerYAnchor)
-        ])
-        renderNoSelection()
-        return container
-    }
-
     private func installActions() {
         searchField.delegate = self
         filterControl.target = self
         filterControl.action = #selector(filterChanged)
-        closeButton.target = self
-        closeButton.action = #selector(closePressed)
-        copyButton.target = self
-        copyButton.action = #selector(restoreSelection)
+        clearButton.target = self
+        clearButton.action = #selector(clearHistoryPressed)
 
         tableView.dataSource = self
         tableView.delegate = self
         tableView.target = self
-        tableView.doubleAction = #selector(restoreSelection)
+        tableView.doubleAction = #selector(tableViewDoubleClicked(_:))
         tableView.contextMenuProvider = { [weak self] row in
             self?.makeContextMenu(for: row)
         }
@@ -385,36 +294,26 @@ public final class ClipboardPanelController: NSObject {
             return nil
         }
 
-        if searchField.currentEditor() === panel.firstResponder,
-           (event.keyCode == 51 || event.keyCode == 117) {
+        let isEditingSearch = searchField.currentEditor() === panel.firstResponder
+        switch ClipboardPanelKeyRouter.command(
+            forKeyCode: event.keyCode,
+            isEditingSearch: isEditingSearch
+        ) {
+        case .passThrough:
             return event
-        }
-
-        switch event.keyCode {
-        case 126:
-            state.moveSelection(by: -1)
+        case .moveSelection(let offset):
+            state.moveSelection(by: offset)
             synchronizeSelection()
-            updatePreview()
             return nil
-        case 125:
-            state.moveSelection(by: 1)
-            synchronizeSelection()
-            updatePreview()
-            return nil
-        case 36, 76:
+        case .restoreSelection:
             restoreSelection()
             return nil
-        case 49:
-            expandPreview()
-            return nil
-        case 51, 117:
+        case .deleteSelection:
             deleteSelection()
             return nil
-        case 53:
+        case .close:
             close()
             return nil
-        default:
-            return event
         }
     }
 
@@ -429,102 +328,24 @@ public final class ClipboardPanelController: NSObject {
 
     private func synchronizeSelection() {
         emptyLabel.isHidden = !state.items.isEmpty
+        clearButton.isEnabled = state.hasAnyHistory
         guard let selectedID = state.selectedID,
               let index = state.items.firstIndex(where: { $0.id == selectedID }) else {
             tableView.deselectAll(nil)
-            copyButton.isEnabled = false
             return
         }
         tableView.selectRowIndexes(IndexSet(integer: index), byExtendingSelection: false)
         tableView.scrollRowToVisible(index)
-        copyButton.isEnabled = true
-    }
-
-    private func updatePreview() {
-        previewGeneration += 1
-        let generation = previewGeneration
-        guard let item = state.selectedItem else {
-            renderNoSelection()
-            return
-        }
-
-        if item.kind == .image {
-            showPreviewPlaceholder("正在加载图片…")
-            Task { @MainActor [weak self] in
-                guard let self else { return }
-                do {
-                    let data = try await store.assetData(for: item)
-                    guard generation == previewGeneration, state.selectedID == item.id else { return }
-                    render(ClipboardPreviewModel(item: item, imageData: data, fileExists: fileExists))
-                } catch {
-                    guard generation == previewGeneration else { return }
-                    showError(error)
-                    render(.unavailable("图片资源不存在"))
-                }
-            }
-        } else {
-            render(ClipboardPreviewModel(item: item, imageData: nil, fileExists: fileExists))
-        }
-    }
-
-    private func fileExists(_ url: URL) -> Bool {
-        FileManager.default.fileExists(atPath: url.path)
-    }
-
-    private func render(_ model: ClipboardPreviewModel) {
-        previewTextScroll.isHidden = true
-        previewImageView.isHidden = true
-        previewPlaceholder.isHidden = true
-        previewImageView.image = nil
-
-        switch model {
-        case .text(let value):
-            previewTitle.stringValue = "文字"
-            previewTextView.string = value
-            previewTextScroll.isHidden = false
-        case .link(let url):
-            previewTitle.stringValue = "链接"
-            previewTextView.string = url.absoluteString
-            previewTextScroll.isHidden = false
-        case .image(let data):
-            previewTitle.stringValue = "图片"
-            if let image = NSImage(data: data) {
-                previewImageView.image = image
-                previewImageView.isHidden = false
-            } else {
-                showPreviewPlaceholder("图片无法预览")
-            }
-        case .files(let entries):
-            previewTitle.stringValue = "文件"
-            previewTextView.string = entries.map { entry in
-                "\(entry.exists ? "✓" : "⚠︎")  \(entry.url.path)"
-            }.joined(separator: "\n\n")
-            previewTextScroll.isHidden = false
-        case .unavailable(let message):
-            previewTitle.stringValue = "预览"
-            showPreviewPlaceholder(message)
-        }
-    }
-
-    private func renderNoSelection() {
-        copyButton.isEnabled = false
-        previewTitle.stringValue = "预览"
-        showPreviewPlaceholder("选择一条记录查看内容")
-    }
-
-    private func showPreviewPlaceholder(_ message: String) {
-        previewTextScroll.isHidden = true
-        previewImageView.isHidden = true
-        previewPlaceholder.stringValue = message
-        previewPlaceholder.isHidden = false
     }
 
     @objc private func filterChanged() {
         scheduleReload()
     }
 
-    @objc private func closePressed() {
-        close()
+    @objc private func tableViewDoubleClicked(_ sender: NSTableView) {
+        guard state.select(row: sender.clickedRow) else { return }
+        synchronizeSelection()
+        restoreSelection()
     }
 
     @objc private func restoreSelection() {
@@ -538,10 +359,67 @@ public final class ClipboardPanelController: NSObject {
                     return
                 }
                 monitor.suppress(changeCount: pasteboard.changeCount)
-                try await store.markRestored(id: item.id)
                 close()
+                do {
+                    try await store.markRestored(id: item.id)
+                } catch {
+                    NSLog("[ScreenshotTool] failed to update clipboard restore timestamp: \(error)")
+                }
             } catch {
                 showError(error)
+            }
+        }
+    }
+
+    @objc private func clearHistoryPressed() {
+        guard state.hasAnyHistory, !isClearConfirmationPresented else { return }
+
+        let alert = NSAlert()
+        alert.alertStyle = .warning
+        alert.messageText = "清空全部剪贴板历史？"
+        alert.informativeText = "所有记录（包括收藏和图片）都将被删除，此操作无法撤销。"
+        alert.addButton(withTitle: "取消")
+        alert.addButton(withTitle: "全部清空")
+        alert.buttons.last?.hasDestructiveAction = true
+
+        isClearConfirmationPresented = true
+        alert.beginSheetModal(for: panel) { [weak self] response in
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                isClearConfirmationPresented = false
+                guard ClipboardClearHistoryPresentation.shouldClear(after: response) else {
+                    return
+                }
+                debounceWorkItem?.cancel()
+                debounceWorkItem = nil
+                reloadGate.beginClear()
+                clearButton.isEnabled = false
+                do {
+                    let result = try await store.clear()
+                    state.apply(
+                        items: [],
+                        hasAnyHistory: false,
+                        preservingSelection: false
+                    )
+                    tableView.reloadData()
+                    synchronizeSelection()
+                    let shouldReload = reloadGate.finishClear()
+                    if result.assetCleanupFailureCount > 0 {
+                        showErrorMessage("历史已清空，部分图片文件将在下次启动时继续清理")
+                    } else {
+                        hideError()
+                    }
+                    if shouldReload {
+                        performReload(hideErrorOnSuccess: result.assetCleanupFailureCount == 0)
+                    }
+                } catch {
+                    let shouldReload = reloadGate.finishClear()
+                    clearButton.isEnabled = state.hasAnyHistory
+                    showError(error)
+                    if shouldReload {
+                        performReload(hideErrorOnSuccess: false)
+                    }
+                }
             }
         }
     }
@@ -581,21 +459,10 @@ public final class ClipboardPanelController: NSObject {
         }
     }
 
-    private func expandPreview() {
-        var frame = panel.frame
-        let targetHeight: CGFloat = isExpanded ? 440 : 620
-        let delta = targetHeight - frame.height
-        frame.origin.y -= delta
-        frame.size.height = targetHeight
-        panel.setFrame(frame, display: true, animate: true)
-        isExpanded.toggle()
-    }
-
     private func makeContextMenu(for row: Int) -> NSMenu? {
         guard state.items.indices.contains(row) else { return nil }
         state.select(id: state.items[row].id)
         synchronizeSelection()
-        updatePreview()
 
         let menu = NSMenu(title: "剪贴板记录")
         menu.delegate = self
@@ -626,26 +493,64 @@ public final class ClipboardPanelController: NSObject {
         errorLabel.isHidden = true
     }
 
-    private func summary(for item: ClipboardItem) -> String {
-        let value = item.plainText.replacingOccurrences(of: "\n", with: " ")
-        return value.isEmpty ? kindTitle(item.kind) : value
-    }
+    private func configureThumbnail(
+        for item: ClipboardItem,
+        presentation: ClipboardHistoryRowPresentation,
+        in cell: ClipboardHistoryCellView
+    ) {
+        cell.thumbnailTask?.cancel()
+        cell.thumbnailTask = nil
+        cell.thumbnailRequestID = nil
+        cell.representedItemID = item.id
+        cell.showPlaceholder(
+            symbolName: presentation.symbolName,
+            accessibilityDescription: presentation.kindTitle
+        )
+        guard presentation.usesImageThumbnail else { return }
 
-    private func kindTitle(_ kind: ClipboardItemKind) -> String {
-        switch kind {
-        case .text: return "文字"
-        case .link: return "链接"
-        case .image: return "图片"
-        case .files: return "文件"
-        }
-    }
+        let requestID = UUID()
+        cell.thumbnailRequestID = requestID
+        cell.thumbnailTask = Task { @MainActor [weak self, weak cell] in
+            guard let self, let cell else { return }
+            defer {
+                if cell.thumbnailRequestID == requestID {
+                    cell.thumbnailTask = nil
+                    cell.thumbnailRequestID = nil
+                }
+            }
+            do {
+                if let cached = await thumbnailLoader.cachedThumbnail(for: item.id) {
+                    guard !Task.isCancelled,
+                          cell.thumbnailRequestID == requestID,
+                          cell.representedItemID == item.id else { return }
+                    cell.showThumbnail(NSImage(
+                        cgImage: cached,
+                        size: NSSize(width: cached.width, height: cached.height)
+                    ))
+                    return
+                }
 
-    private func symbolName(for kind: ClipboardItemKind) -> String {
-        switch kind {
-        case .text: return "text.alignleft"
-        case .link: return "link"
-        case .image: return "photo"
-        case .files: return "doc.on.doc"
+                guard let data = try await store.assetData(for: item),
+                      !Task.isCancelled,
+                      cell.thumbnailRequestID == requestID,
+                      cell.representedItemID == item.id,
+                      let decoded = await thumbnailLoader.thumbnail(
+                        for: item.id,
+                        data: data,
+                        maximumPixelSize: 84
+                      ),
+                      !Task.isCancelled,
+                      cell.thumbnailRequestID == requestID,
+                      cell.representedItemID == item.id else {
+                    return
+                }
+                cell.showThumbnail(NSImage(
+                    cgImage: decoded,
+                    size: NSSize(width: decoded.width, height: decoded.height)
+                ))
+            } catch {
+                // Keep the photo placeholder when an old image resource is unavailable.
+            }
         }
     }
 
@@ -676,9 +581,11 @@ extension ClipboardPanelController: NSTableViewDataSource, NSTableViewDelegate {
         let cell = (tableView.makeView(withIdentifier: identifier, owner: self) as? ClipboardHistoryCellView)
             ?? ClipboardHistoryCellView(identifier: identifier)
         let item = state.items[row]
-        cell.kindImage.image = NSImage(systemSymbolName: symbolName(for: item.kind), accessibilityDescription: kindTitle(item.kind))
-        cell.summaryField.stringValue = summary(for: item)
+        let presentation = ClipboardHistoryRowPresentation(item: item)
+        cell.summaryField.stringValue = presentation.summary
+        cell.summaryField.fullText = presentation.toolTip
         cell.detailField.stringValue = detail(for: item)
+        configureThumbnail(for: item, presentation: presentation, in: cell)
         cell.favoriteButton.image = NSImage(
             systemSymbolName: item.isFavorite ? "star.fill" : "star",
             accessibilityDescription: item.isFavorite ? "取消收藏" : "收藏"
@@ -693,7 +600,6 @@ extension ClipboardPanelController: NSTableViewDataSource, NSTableViewDelegate {
     public func tableViewSelectionDidChange(_ notification: Notification) {
         let row = tableView.selectedRow
         state.select(id: state.items.indices.contains(row) ? state.items[row].id : nil)
-        updatePreview()
     }
 }
 
@@ -729,9 +635,12 @@ private final class ClipboardHistoryTableView: NSTableView {
 
 private final class ClipboardHistoryCellView: NSTableCellView {
     let kindImage = NSImageView()
-    let summaryField = NSTextField(labelWithString: "")
+    let summaryField = ClipboardHoverTextField()
     let detailField = NSTextField(labelWithString: "")
     let favoriteButton = NSButton()
+    var representedItemID: UUID?
+    var thumbnailRequestID: UUID?
+    var thumbnailTask: Task<Void, Never>?
 
     init(identifier: NSUserInterfaceItemIdentifier) {
         super.init(frame: .zero)
@@ -741,6 +650,8 @@ private final class ClipboardHistoryCellView: NSTableCellView {
 
         kindImage.symbolConfiguration = .init(pointSize: 17, weight: .regular)
         kindImage.contentTintColor = .labelColor
+        kindImage.imageScaling = .scaleProportionallyUpOrDown
+        kindImage.wantsLayer = true
         kindImage.translatesAutoresizingMaskIntoConstraints = false
 
         summaryField.font = .systemFont(ofSize: 13, weight: .medium)
@@ -763,10 +674,10 @@ private final class ClipboardHistoryCellView: NSTableCellView {
         addSubview(detailField)
         addSubview(favoriteButton)
         NSLayoutConstraint.activate([
-            kindImage.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 10),
+            kindImage.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 8),
             kindImage.centerYAnchor.constraint(equalTo: centerYAnchor),
-            kindImage.widthAnchor.constraint(equalToConstant: 23),
-            kindImage.heightAnchor.constraint(equalToConstant: 23),
+            kindImage.widthAnchor.constraint(equalToConstant: 42),
+            kindImage.heightAnchor.constraint(equalToConstant: 42),
             favoriteButton.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -8),
             favoriteButton.centerYAnchor.constraint(equalTo: centerYAnchor),
             favoriteButton.widthAnchor.constraint(equalToConstant: 26),
@@ -778,6 +689,28 @@ private final class ClipboardHistoryCellView: NSTableCellView {
             detailField.trailingAnchor.constraint(equalTo: summaryField.trailingAnchor),
             detailField.topAnchor.constraint(equalTo: summaryField.bottomAnchor, constant: 4)
         ])
+    }
+
+    func showPlaceholder(symbolName: String, accessibilityDescription: String) {
+        kindImage.image = NSImage(
+            systemSymbolName: symbolName,
+            accessibilityDescription: accessibilityDescription
+        )
+        kindImage.contentTintColor = .secondaryLabelColor
+        kindImage.layer?.cornerRadius = 0
+        kindImage.layer?.masksToBounds = false
+    }
+
+    func showThumbnail(_ image: NSImage) {
+        kindImage.image = image
+        kindImage.contentTintColor = nil
+        kindImage.layer?.cornerRadius = 7
+        kindImage.layer?.cornerCurve = .continuous
+        kindImage.layer?.masksToBounds = true
+    }
+
+    deinit {
+        thumbnailTask?.cancel()
     }
 
     required init?(coder: NSCoder) {

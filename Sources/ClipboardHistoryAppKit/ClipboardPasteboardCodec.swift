@@ -67,10 +67,9 @@ public enum ClipboardPasteboardCodec {
         assetData: Data?,
         to pasteboard: NSPasteboard
     ) -> Bool {
-        pasteboard.clearContents()
-
         switch item.kind {
         case .text:
+            pasteboard.clearContents()
             return pasteboard.setString(item.plainText, forType: .string)
 
         case .link:
@@ -80,6 +79,7 @@ public enum ClipboardPasteboardCodec {
                   value.setString(item.plainText, forType: .string) else {
                 return false
             }
+            pasteboard.clearContents()
             return pasteboard.writeObjects([value])
 
         case .image:
@@ -89,10 +89,12 @@ public enum ClipboardPasteboardCodec {
             if let tiff = NSImage(data: assetData)?.tiffRepresentation {
                 _ = value.setData(tiff, forType: .tiff)
             }
+            pasteboard.clearContents()
             return pasteboard.writeObjects([value])
 
         case .files:
             guard !item.fileURLs.isEmpty else { return false }
+            pasteboard.clearContents()
             return pasteboard.writeObjects(item.fileURLs.map { $0 as NSURL })
         }
     }

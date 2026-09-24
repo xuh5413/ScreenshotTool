@@ -70,6 +70,26 @@ struct ClipboardHistoryCoreChecks {
         try await store.open()
         expect(!fileManager.fileExists(atPath: orphanURL.path), "opening the store must remove orphan image assets")
 
+        let outsideAssetURL = root.appendingPathComponent("outside.png")
+        try Data([4, 5, 6]).write(to: outsideAssetURL)
+        let traversalItem = ClipboardItem(
+            id: UUID(),
+            kind: .image,
+            contentHash: "traversal",
+            plainText: "图片",
+            assetPath: "../outside.png",
+            fileURLs: [],
+            source: source,
+            createdAt: .now,
+            updatedAt: .now,
+            lastRestoredAt: nil,
+            isFavorite: false,
+            byteSize: 3
+        )
+        let traversalData = try await store.assetData(for: traversalItem)
+        expect(traversalData == nil, "asset paths must never escape the image resource directory")
+        expect(fileManager.fileExists(atPath: outsideAssetURL.path), "invalid asset paths must not touch outside files")
+
         let firstStored = try await store.upsert(
             try ClipboardContentNormalizer.normalized(candidate: first)
         )
@@ -130,7 +150,24 @@ struct ClipboardHistoryCoreChecks {
         let rowAfterMissingAsset = try await store.query(.init(filter: .image))
         expect(rowAfterMissingAsset.contains(where: { $0.id == missing.id }), "missing assets must not delete metadata")
 
-        try await store.clear()
+        _ = try await store.upsert(try ClipboardContentNormalizer.normalized(candidate: .init(
+            payload: .imagePNG(Data([10, 11, 12])),
+            source: source,
+            capturedAt: Date(timeIntervalSince1970: 6)
+        )))
+        try fileManager.setAttributes([.posixPermissions: 0o500], ofItemAtPath: assetsURL.path)
+        let clearResult: ClipboardClearResult
+        do {
+            clearResult = try await store.clear()
+        } catch {
+            try? fileManager.setAttributes([.posixPermissions: 0o700], ofItemAtPath: assetsURL.path)
+            throw error
+        }
+        try fileManager.setAttributes([.posixPermissions: 0o700], ofItemAtPath: assetsURL.path)
+        expect(
+            clearResult.assetCleanupFailureCount == 1,
+            "clear must report image cleanup failures after committing history deletion"
+        )
         let clearedItems = try await store.query()
         expect(clearedItems.isEmpty, "clear must remove every database row")
 

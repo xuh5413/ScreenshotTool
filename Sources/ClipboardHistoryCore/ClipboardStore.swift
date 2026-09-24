@@ -8,6 +8,14 @@ public enum ClipboardStoreError: Error, Equatable, Sendable {
     case assetCapacityExceeded
 }
 
+public struct ClipboardClearResult: Equatable, Sendable {
+    public let assetCleanupFailureCount: Int
+
+    public init(assetCleanupFailureCount: Int) {
+        self.assetCleanupFailureCount = assetCleanupFailureCount
+    }
+}
+
 private let sqliteTransient = unsafeBitCast(-1, to: sqlite3_destructor_type.self)
 
 public actor ClipboardStore {
@@ -117,14 +125,19 @@ public actor ClipboardStore {
         let createdAt = existing?.createdAt ?? content.capturedAt
         let assetPath: String?
         if content.kind == .image {
-            assetPath = existing?.assetPath ?? "\(id.uuidString).png"
+            if let existingPath = existing?.assetPath, assetURL(for: existingPath) != nil {
+                assetPath = existingPath
+            } else {
+                assetPath = "\(id.uuidString).png"
+            }
         } else {
             assetPath = nil
         }
 
         var writtenAssetURL: URL?
-        if let imageData = content.imagePNG, let assetPath {
-            let destination = assetsDirectoryURL.appendingPathComponent(assetPath)
+        if let imageData = content.imagePNG,
+           let assetPath,
+           let destination = assetURL(for: assetPath) {
             do {
                 try imageData.write(to: destination, options: .atomic)
                 writtenAssetURL = destination
@@ -223,7 +236,8 @@ public actor ClipboardStore {
         try removeAsset(for: item)
     }
 
-    public func clear() throws {
+    @discardableResult
+    public func clear() throws -> ClipboardClearResult {
         let items = try allItems()
         try beginTransaction()
         do {
@@ -233,9 +247,16 @@ public actor ClipboardStore {
             try? rollbackTransaction()
             throw error
         }
+        var assetCleanupFailureCount = 0
         for item in items {
-            try removeAsset(for: item)
+            do {
+                try removeAsset(for: item)
+            } catch {
+                assetCleanupFailureCount += 1
+                NSLog("[ScreenshotTool] clipboard asset cleanup deferred: \(error)")
+            }
         }
+        return ClipboardClearResult(assetCleanupFailureCount: assetCleanupFailureCount)
     }
 
     public func markRestored(id: UUID, at date: Date = Date()) throws {
@@ -248,9 +269,12 @@ public actor ClipboardStore {
 
     public func assetData(for item: ClipboardItem) throws -> Data? {
         try ensureOpen()
-        guard let assetPath = item.assetPath else { return nil }
-        let url = assetsDirectoryURL.appendingPathComponent(assetPath)
+        guard let assetPath = item.assetPath,
+              let url = assetURL(for: assetPath) else { return nil }
         guard FileManager.default.fileExists(atPath: url.path) else { return nil }
+        if (try? url.resourceValues(forKeys: [.isSymbolicLinkKey]).isSymbolicLink) == true {
+            return nil
+        }
         do {
             return try Data(contentsOf: url)
         } catch {
@@ -398,8 +422,8 @@ public actor ClipboardStore {
     }
 
     private func removeAsset(for item: ClipboardItem) throws {
-        guard let assetPath = item.assetPath else { return }
-        let url = assetsDirectoryURL.appendingPathComponent(assetPath)
+        guard let assetPath = item.assetPath,
+              let url = assetURL(for: assetPath) else { return }
         guard FileManager.default.fileExists(atPath: url.path) else { return }
         do {
             try FileManager.default.removeItem(at: url)
@@ -409,7 +433,10 @@ public actor ClipboardStore {
     }
 
     private func cleanupOrphanAssets() throws {
-        let referenced = Set(try allItems().compactMap(\.assetPath))
+        let referenced = Set(try allItems().compactMap { item -> String? in
+            guard let path = item.assetPath, assetURL(for: path) != nil else { return nil }
+            return path
+        })
         let contents: [URL]
         do {
             contents = try FileManager.default.contentsOfDirectory(
@@ -608,6 +635,17 @@ public actor ClipboardStore {
             .replacingOccurrences(of: "\\", with: "\\\\")
             .replacingOccurrences(of: "%", with: "\\%")
             .replacingOccurrences(of: "_", with: "\\_")
+    }
+
+    private func assetURL(for relativePath: String) -> URL? {
+        guard !relativePath.isEmpty,
+              relativePath == (relativePath as NSString).lastPathComponent,
+              !relativePath.contains("/"),
+              !relativePath.contains("\\"),
+              (relativePath as NSString).pathExtension.lowercased() == "png" else {
+            return nil
+        }
+        return assetsDirectoryURL.appendingPathComponent(relativePath, isDirectory: false)
     }
 }
 

@@ -1,19 +1,22 @@
 import Carbon
 import Foundation
 
-@MainActor
 public final class ClipboardHotkeyActionRouter {
+    private let expectedSignature: OSType
     private let expectedID: UInt32
     private let action: () -> Void
 
-    public init(expectedID: UInt32, action: @escaping () -> Void) {
+    public init(expectedSignature: OSType, expectedID: UInt32, action: @escaping () -> Void) {
+        self.expectedSignature = expectedSignature
         self.expectedID = expectedID
         self.action = action
     }
 
-    public func handle(id: UInt32) {
-        guard id == expectedID else { return }
+    @discardableResult
+    public func handle(signature: OSType, id: UInt32) -> Bool {
+        guard signature == expectedSignature, id == expectedID else { return false }
         action()
+        return true
     }
 }
 
@@ -31,7 +34,11 @@ public final class ClipboardHotkeyManager {
     @discardableResult
     public func register(action: @escaping () -> Void) -> Bool {
         unregister()
-        router = ClipboardHotkeyActionRouter(expectedID: Self.hotkeyID, action: action)
+        router = ClipboardHotkeyActionRouter(
+            expectedSignature: Self.hotkeySignature,
+            expectedID: Self.hotkeyID,
+            action: action
+        )
         guard installEventHandler() else {
             router = nil
             return false
@@ -80,7 +87,7 @@ public final class ClipboardHotkeyManager {
             eventKind: UInt32(kEventHotKeyPressed)
         )
         let callback: EventHandlerProcPtr = { _, event, userData in
-            guard let event, let userData else { return noErr }
+            guard let event, let userData else { return OSStatus(eventNotHandledErr) }
             let manager = Unmanaged<ClipboardHotkeyManager>
                 .fromOpaque(userData)
                 .takeUnretainedValue()
@@ -94,12 +101,10 @@ public final class ClipboardHotkeyManager {
                 nil,
                 &identifier
             )
-            if status == noErr,
-               identifier.signature == ClipboardHotkeyManager.hotkeySignature,
-               identifier.id == ClipboardHotkeyManager.hotkeyID {
-                manager.router?.handle(id: identifier.id)
-            }
-            return noErr
+            guard status == noErr else { return OSStatus(eventNotHandledErr) }
+            return manager.router?.handle(signature: identifier.signature, id: identifier.id) == true
+                ? OSStatus(noErr)
+                : OSStatus(eventNotHandledErr)
         }
         let status = InstallEventHandler(
             GetApplicationEventTarget(),

@@ -11,18 +11,27 @@ struct ClipboardHistoryAppKitChecks {
         try checkPasteboardDecoding(source: source)
         try checkPasteboardRestore(source: source)
         try await checkMonitorSuppressionAndPriority(source: source)
-        checkPanelStateAndPreview()
+        checkPanelState()
+        await ClipboardPanelPresentationChecks.run()
         await checkHotkeyRoutingAndStartupIsolation()
         print("✅ ClipboardHistoryAppKitChecks passed")
     }
 
     private static func checkHotkeyRoutingAndStartupIsolation() async {
         var fired = false
-        let router = ClipboardHotkeyActionRouter(expectedID: 2) { fired = true }
-        router.handle(id: 1)
-        expect(!fired, "screenshot hotkey ID must not trigger clipboard history")
-        router.handle(id: 2)
-        expect(fired, "clipboard hotkey ID must trigger clipboard history")
+        let router = ClipboardHotkeyActionRouter(expectedSignature: 0x434C4950, expectedID: 2) {
+            fired = true
+        }
+        expect(
+            !router.handle(signature: 0x5352544C, id: 2),
+            "a screenshot signature with the clipboard ID must not be handled"
+        )
+        expect(!fired, "a mismatched signature must not trigger clipboard history")
+        expect(
+            router.handle(signature: 0x434C4950, id: 2),
+            "the exact clipboard signature and ID must be handled"
+        )
+        expect(fired, "the exact clipboard signature and ID must trigger clipboard history")
 
         let root = FileManager.default.temporaryDirectory
             .appendingPathComponent("clipboard-startup-check-\(UUID().uuidString)", isDirectory: true)
@@ -37,7 +46,7 @@ struct ClipboardHistoryAppKitChecks {
         }
     }
 
-    private static func checkPanelStateAndPreview() {
+    private static func checkPanelState() {
         let textItem = makeItem(kind: .text, plainText: "first")
         let imageItem = makeItem(kind: .image, plainText: "图片", assetPath: "image.png")
         let fileURL = URL(fileURLWithPath: "/definitely-missing/clipboard-history-file")
@@ -51,24 +60,19 @@ struct ClipboardHistoryAppKitChecks {
         expect(state.selectedID == fileItem.id, "selection must clamp at the end")
         state.apply(items: [fileItem], preservingSelection: true)
         expect(state.selectedID == fileItem.id, "reload must keep an available selection")
+        state.apply(items: [textItem, imageItem, fileItem], preservingSelection: false)
+        expect(state.select(row: 1), "double-click activation must accept an existing row")
+        expect(state.selectedID == imageItem.id, "double-click activation must select the clicked row")
+        expect(!state.select(row: 10), "double-click activation must reject an invalid row")
+        expect(state.selectedID == imageItem.id, "an invalid double click must preserve the selection")
         state.apply(items: [], preservingSelection: true)
         expect(state.selectedID == nil, "empty results must clear selection")
+        state.apply(items: [], hasAnyHistory: true, preservingSelection: true)
+        expect(
+            state.hasAnyHistory,
+            "an empty search or filter result must not disable clearing history that still exists"
+        )
 
-        expect(
-            ClipboardPreviewModel(item: imageItem, imageData: nil, fileExists: { _ in false })
-                == .unavailable("图片资源不存在"),
-            "missing image data must produce an unavailable preview"
-        )
-        expect(
-            ClipboardPreviewModel(item: fileItem, imageData: nil, fileExists: { _ in false })
-                == .unavailable("文件不存在"),
-            "missing files must produce an unavailable preview"
-        )
-        expect(
-            ClipboardPreviewModel(item: textItem, imageData: nil, fileExists: { _ in false })
-                == .text("first"),
-            "text preview must retain the full string"
-        )
     }
 
     private static func checkPasteboardDecoding(source: ClipboardSource) throws {
@@ -139,7 +143,13 @@ struct ClipboardHistoryAppKitChecks {
         expect(ClipboardPasteboardCodec.restore(item: image, assetData: imageData, to: board), "image restore must succeed")
         expect(board.data(forType: .png) != nil, "image restore must write PNG data")
         expect(board.data(forType: .tiff) != nil, "image restore must write TIFF compatibility data")
+        board.clearContents()
+        board.setString("keep existing clipboard", forType: .string)
         expect(!ClipboardPasteboardCodec.restore(item: image, assetData: nil, to: board), "missing image data must fail")
+        expect(
+            board.string(forType: .string) == "keep existing clipboard",
+            "failed restore must preserve the existing clipboard"
+        )
 
         let fileURLs = [URL(fileURLWithPath: "/tmp/a"), URL(fileURLWithPath: "/tmp/b")]
         let files = makeItem(kind: .files, plainText: "a b", fileURLs: fileURLs)

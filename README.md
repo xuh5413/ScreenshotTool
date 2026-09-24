@@ -1,4 +1,4 @@
-# ScreenshotTool
+# SnipKeep
 
 macOS 截图工具，基于 ScreenCaptureKit 构建，提供丰富的截图、标注和长截图功能。
 
@@ -33,7 +33,7 @@ macOS 截图工具，基于 ScreenCaptureKit 构建，提供丰富的截图、�
 脚本会自动编译、打包 `.app` bundle 并安装到 `/Applications`。安装后可从启动台或以下命令启动：
 
 ```bash
-open "/Applications/截图工具.app"
+open "/Applications/SnipKeep.app"
 ```
 
 ## 使用

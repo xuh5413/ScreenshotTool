@@ -1,7 +1,8 @@
 #!/bin/bash
 set -e
 
-APP_NAME="截图工具"
+APP_NAME="SnipKeep"
+LEGACY_APP_NAME="截图工具"
 PROJECT_DIR="$(cd "$(dirname "$0")" && pwd)"
 BUILD_DIR="$PROJECT_DIR/.build"
 
@@ -39,6 +40,13 @@ codesign --force --deep --sign - "$APP_BUNDLE"
 INSTALL_TARGET="/Applications/$APP_NAME.app"
 rm -rf "$INSTALL_TARGET"
 cp -R "$APP_BUNDLE" "$INSTALL_TARGET"
+
+# The product name changed, so remove the previously installed bundle only
+# after the replacement has been copied successfully.
+LEGACY_INSTALL_TARGET="/Applications/$LEGACY_APP_NAME.app"
+if [ "$LEGACY_INSTALL_TARGET" != "$INSTALL_TARGET" ] && [ -d "$LEGACY_INSTALL_TARGET" ]; then
+    rm -rf "$LEGACY_INSTALL_TARGET"
+fi
 
 echo "✅ Build complete: $APP_BUNDLE"
 echo "   Installed to: $INSTALL_TARGET"
