@@ -86,14 +86,20 @@ public actor ClipboardStore {
                   updated_at REAL NOT NULL,
                   last_restored_at REAL,
                   is_favorite INTEGER NOT NULL DEFAULT 0,
+                  is_pinned INTEGER NOT NULL DEFAULT 0,
                   byte_size INTEGER NOT NULL
                 )
                 """,
                 operation: "create clipboard table"
             )
+            try addPinnedColumnIfNeeded()
             try execute(
                 "CREATE INDEX IF NOT EXISTS clipboard_items_updated_idx ON clipboard_items(updated_at DESC)",
                 operation: "create updated index"
+            )
+            try execute(
+                "CREATE INDEX IF NOT EXISTS clipboard_items_pinned_idx ON clipboard_items(is_pinned DESC, updated_at DESC)",
+                operation: "create pinned index"
             )
             try execute(
                 "CREATE INDEX IF NOT EXISTS clipboard_items_kind_idx ON clipboard_items(kind)",
@@ -206,7 +212,7 @@ public actor ClipboardStore {
         if !clauses.isEmpty {
             sql += " WHERE " + clauses.joined(separator: " AND ")
         }
-        sql += " ORDER BY updated_at DESC, id ASC LIMIT ?"
+        sql += " ORDER BY is_pinned DESC, updated_at DESC, id ASC LIMIT ?"
         bindings.append(.int64(Int64(max(0, query.limit))))
         return try readItems(sql: sql, bindings: bindings)
     }
@@ -216,6 +222,14 @@ public actor ClipboardStore {
             "UPDATE clipboard_items SET is_favorite = ? WHERE id = ?",
             bindings: [.int64(isFavorite ? 1 : 0), .text(id.uuidString)],
             operation: "set favorite"
+        )
+    }
+
+    public func setPinned(id: UUID, isPinned: Bool) throws {
+        try executeMutation(
+            "UPDATE clipboard_items SET is_pinned = ? WHERE id = ?",
+            bindings: [.int64(isPinned ? 1 : 0), .text(id.uuidString)],
+            operation: "set pinned"
         )
     }
 
@@ -304,8 +318,8 @@ public actor ClipboardStore {
             INSERT INTO clipboard_items (
               id, kind, content_hash, plain_text, asset_path, file_urls,
               source_app_name, source_bundle_id, created_at, updated_at,
-              last_restored_at, is_favorite, byte_size
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, 0, ?)
+              last_restored_at, is_favorite, is_pinned, byte_size
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, 0, 0, ?)
             """,
             bindings: [
                 .text(id.uuidString),
@@ -381,7 +395,7 @@ public actor ClipboardStore {
         guard total + byteSize > retentionPolicy.maxAssetBytes else { return }
 
         let eligible = items
-            .filter { $0.kind == .image && !$0.isFavorite }
+            .filter { $0.kind == .image && !$0.isProtectedFromCleanup }
             .sorted {
                 if $0.updatedAt != $1.updatedAt { return $0.updatedAt < $1.updatedAt }
                 return $0.id.uuidString < $1.id.uuidString
@@ -459,7 +473,7 @@ public actor ClipboardStore {
     private static let columns = """
     id, kind, content_hash, plain_text, asset_path, file_urls,
     source_app_name, source_bundle_id, created_at, updated_at,
-    last_restored_at, is_favorite, byte_size
+    last_restored_at, is_favorite, is_pinned, byte_size
     """
 
     private func readItems(sql: String, bindings: [SQLiteBinding]) throws -> [ClipboardItem] {
@@ -509,7 +523,33 @@ public actor ClipboardStore {
             updatedAt: Date(timeIntervalSince1970: sqlite3_column_double(statement, 9)),
             lastRestoredAt: restoredAt,
             isFavorite: sqlite3_column_int(statement, 11) != 0,
-            byteSize: sqlite3_column_int64(statement, 12)
+            isPinned: sqlite3_column_int(statement, 12) != 0,
+            byteSize: sqlite3_column_int64(statement, 13)
+        )
+    }
+
+    private func addPinnedColumnIfNeeded() throws {
+        let statement = try prepare(
+            "PRAGMA table_info(clipboard_items)",
+            operation: "inspect clipboard schema"
+        )
+        defer { sqlite3_finalize(statement) }
+        var hasPinnedColumn = false
+        while true {
+            let status = sqlite3_step(statement)
+            if status == SQLITE_DONE { break }
+            guard status == SQLITE_ROW else {
+                throw operationError("inspect clipboard schema", status: status)
+            }
+            if columnText(statement, 1) == "is_pinned" {
+                hasPinnedColumn = true
+                break
+            }
+        }
+        guard !hasPinnedColumn else { return }
+        try execute(
+            "ALTER TABLE clipboard_items ADD COLUMN is_pinned INTEGER NOT NULL DEFAULT 0",
+            operation: "add pinned column"
         )
     }
 

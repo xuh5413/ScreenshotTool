@@ -54,7 +54,7 @@ let package = Package(
         ),
         .executableTarget(
             name: "ClipboardHistoryCoreChecks",
-            dependencies: ["ClipboardHistoryCore"],
+            dependencies: ["ClipboardHistoryCore", "CSQLite"],
             path: "Tests/ClipboardHistoryCoreChecks"
         ),
         .executableTarget(

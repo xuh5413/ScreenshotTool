@@ -23,7 +23,7 @@ public struct ClipboardRetentionPolicy: Sendable {
         now: Date
     ) -> [UUID] {
         let eligible = items
-            .filter { !$0.isFavorite }
+            .filter { !$0.isProtectedFromCleanup }
             .sorted(by: isOlder)
         let expirationDate = now.addingTimeInterval(-maxAge)
         var evicted = Set<UUID>()

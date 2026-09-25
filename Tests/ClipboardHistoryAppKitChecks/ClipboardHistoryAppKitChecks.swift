@@ -7,6 +7,12 @@ import Foundation
 @MainActor
 struct ClipboardHistoryAppKitChecks {
     static func main() async throws {
+        if CommandLine.arguments.contains("--presentation-only") {
+            await ClipboardPanelPresentationChecks.run()
+            print("✅ ClipboardPanelPresentationChecks passed")
+            return
+        }
+
         let source = ClipboardSource(appName: "Notes", bundleID: "com.apple.Notes")
         try checkPasteboardDecoding(source: source)
         try checkPasteboardRestore(source: source)

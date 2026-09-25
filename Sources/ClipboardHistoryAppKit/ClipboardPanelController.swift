@@ -9,14 +9,9 @@ public final class ClipboardPanelController: NSObject {
     private let pasteboard: NSPasteboard
     private let panel: ClipboardHistoryPanel
 
-    private let searchField = NSSearchField()
-    private let filterControl = NSSegmentedControl(
-        labels: ["全部", "文字", "图片", "文件", "收藏"],
-        trackingMode: .selectOne,
-        target: nil,
-        action: nil
-    )
-    private let clearButton = NSButton()
+    private let searchField = ClipboardSearchField()
+    private let filterControl = ClipboardFilterPopUpButton()
+    private let clearHistoryMenuItem = NSMenuItem()
     private let tableView = ClipboardHistoryTableView()
     private let emptyLabel = NSTextField(labelWithString: "暂无剪贴板历史")
     private let errorLabel = NSTextField(wrappingLabelWithString: "")
@@ -29,6 +24,7 @@ public final class ClipboardPanelController: NSObject {
     private var reloadGate = ClipboardReloadGate()
     private var isContextMenuTracking = false
     private var isClearConfirmationPresented = false
+    private var selectedFilterIndex = 0
 
     public init(
         store: ClipboardStore,
@@ -72,8 +68,11 @@ public final class ClipboardPanelController: NSObject {
         if !panel.isVisible {
             panel.center()
         }
+        panel.contentView?.layoutSubtreeIfNeeded()
         NSApp.activate(ignoringOtherApps: true)
         panel.makeKeyAndOrderFront(nil)
+        panel.makeFirstResponder(searchField)
+        searchField.layoutSubtreeIfNeeded()
         installEventMonitorIfNeeded()
         reload()
     }
@@ -130,7 +129,7 @@ public final class ClipboardPanelController: NSObject {
     }
 
     private var selectedFilter: ClipboardFilter {
-        switch filterControl.selectedSegment {
+        switch selectedFilterIndex {
         case 1: return .text
         case 2: return .image
         case 3: return .files
@@ -160,32 +159,32 @@ public final class ClipboardPanelController: NSObject {
     }
 
     private func buildInterface() {
-        let root = NSVisualEffectView()
+        let root = ClipboardPanelRootView()
         ClipboardPanelStyling.apply(to: panel, root: root)
         panel.contentView = root
 
-        searchField.placeholderString = "搜索剪贴板历史"
         searchField.sendsSearchStringImmediately = true
+        ClipboardSearchFieldPresentation.apply(to: searchField)
         searchField.translatesAutoresizingMaskIntoConstraints = false
 
-        ClipboardFilterControlStyling.apply(to: filterControl)
+        ClipboardFilterMenuPresentation.apply(to: filterControl)
+        clearHistoryMenuItem.title = "清空全部历史…"
+        clearHistoryMenuItem.target = self
+        clearHistoryMenuItem.action = #selector(clearHistoryPressed)
+        clearHistoryMenuItem.isEnabled = false
+        filterControl.menu?.addItem(.separator())
+        filterControl.menu?.addItem(clearHistoryMenuItem)
         filterControl.translatesAutoresizingMaskIntoConstraints = false
 
-        ClipboardClearHistoryPresentation.apply(to: clearButton)
-        clearButton.translatesAutoresizingMaskIntoConstraints = false
-
-        let topRow = NSStackView(views: [searchField, filterControl, clearButton])
+        let topRow = NSStackView(views: [searchField, filterControl])
         topRow.orientation = .horizontal
         topRow.alignment = .centerY
-        topRow.spacing = 10
+        topRow.distribution = .fill
+        topRow.spacing = ClipboardPanelLayout.headerSpacing
         topRow.translatesAutoresizingMaskIntoConstraints = false
         searchField.setContentHuggingPriority(.defaultLow, for: .horizontal)
+        searchField.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
         filterControl.setContentHuggingPriority(.required, for: .horizontal)
-        clearButton.setContentHuggingPriority(.required, for: .horizontal)
-
-        let divider = NSBox()
-        divider.boxType = .separator
-        divider.translatesAutoresizingMaskIntoConstraints = false
 
         let listContainer = buildListContainer()
 
@@ -193,27 +192,43 @@ public final class ClipboardPanelController: NSObject {
         errorLabel.font = .systemFont(ofSize: 11)
         errorLabel.isHidden = true
 
-        let rootStack = NSStackView(views: [topRow, divider, listContainer, errorLabel])
+        let rootStack = NSStackView(views: [topRow, listContainer, errorLabel])
         rootStack.orientation = .vertical
         rootStack.alignment = .leading
-        rootStack.spacing = 10
+        rootStack.spacing = ClipboardPanelLayout.headerListSpacing
         rootStack.translatesAutoresizingMaskIntoConstraints = false
         root.addSubview(rootStack)
 
         NSLayoutConstraint.activate([
-            rootStack.leadingAnchor.constraint(equalTo: root.leadingAnchor, constant: 14),
-            rootStack.trailingAnchor.constraint(equalTo: root.trailingAnchor, constant: -14),
-            rootStack.topAnchor.constraint(equalTo: root.topAnchor, constant: 14),
-            rootStack.bottomAnchor.constraint(equalTo: root.bottomAnchor, constant: -14),
+            rootStack.leadingAnchor.constraint(
+                equalTo: root.leadingAnchor,
+                constant: ClipboardPanelLayout.contentInset
+            ),
+            rootStack.trailingAnchor.constraint(
+                equalTo: root.trailingAnchor,
+                constant: -ClipboardPanelLayout.contentInset
+            ),
+            rootStack.topAnchor.constraint(
+                equalTo: root.topAnchor,
+                constant: ClipboardPanelLayout.verticalContentInset
+            ),
+            rootStack.bottomAnchor.constraint(
+                equalTo: root.bottomAnchor,
+                constant: -ClipboardPanelLayout.verticalContentInset
+            ),
             topRow.widthAnchor.constraint(equalTo: rootStack.widthAnchor),
-            divider.widthAnchor.constraint(equalTo: rootStack.widthAnchor),
             listContainer.widthAnchor.constraint(equalTo: rootStack.widthAnchor),
             listContainer.heightAnchor.constraint(
                 greaterThanOrEqualToConstant: ClipboardPanelLayout.minimumListHeight
             ),
             errorLabel.widthAnchor.constraint(equalTo: rootStack.widthAnchor),
-            clearButton.widthAnchor.constraint(equalToConstant: 26),
-            clearButton.heightAnchor.constraint(equalToConstant: 24)
+            searchField.heightAnchor.constraint(
+                equalToConstant: ClipboardPanelLayout.headerControlHeight
+            ),
+            filterControl.widthAnchor.constraint(equalToConstant: ClipboardPanelLayout.filterWidth),
+            filterControl.heightAnchor.constraint(
+                equalToConstant: ClipboardPanelLayout.headerControlHeight
+            )
         ])
     }
 
@@ -225,8 +240,9 @@ public final class ClipboardPanelController: NSObject {
         column.resizingMask = .autoresizingMask
         tableView.addTableColumn(column)
         tableView.headerView = nil
-        tableView.rowHeight = 58
-        tableView.intercellSpacing = NSSize(width: 0, height: 3)
+        tableView.style = ClipboardPanelLayout.tableStyle
+        tableView.rowHeight = ClipboardPanelLayout.rowHeight
+        tableView.intercellSpacing = NSSize(width: 0, height: ClipboardPanelLayout.rowSpacing)
         tableView.selectionHighlightStyle = .regular
         tableView.allowsMultipleSelection = false
         tableView.backgroundColor = .clear
@@ -260,8 +276,6 @@ public final class ClipboardPanelController: NSObject {
         searchField.delegate = self
         filterControl.target = self
         filterControl.action = #selector(filterChanged)
-        clearButton.target = self
-        clearButton.action = #selector(clearHistoryPressed)
 
         tableView.dataSource = self
         tableView.delegate = self
@@ -328,7 +342,7 @@ public final class ClipboardPanelController: NSObject {
 
     private func synchronizeSelection() {
         emptyLabel.isHidden = !state.items.isEmpty
-        clearButton.isEnabled = state.hasAnyHistory
+        clearHistoryMenuItem.isEnabled = state.hasAnyHistory
         guard let selectedID = state.selectedID,
               let index = state.items.firstIndex(where: { $0.id == selectedID }) else {
             tableView.deselectAll(nil)
@@ -339,6 +353,14 @@ public final class ClipboardPanelController: NSObject {
     }
 
     @objc private func filterChanged() {
+        let selectedIndex = filterControl.indexOfSelectedItem
+        guard ClipboardFilterMenuPresentation.titles.indices.contains(selectedIndex) else {
+            filterControl.selectItem(at: selectedFilterIndex)
+            filterControl.synchronizeDisplayedTitle()
+            return
+        }
+        selectedFilterIndex = selectedIndex
+        filterControl.synchronizeDisplayedTitle()
         scheduleReload()
     }
 
@@ -372,12 +394,14 @@ public final class ClipboardPanelController: NSObject {
     }
 
     @objc private func clearHistoryPressed() {
+        filterControl.selectItem(at: selectedFilterIndex)
+        filterControl.synchronizeDisplayedTitle()
         guard state.hasAnyHistory, !isClearConfirmationPresented else { return }
 
         let alert = NSAlert()
         alert.alertStyle = .warning
         alert.messageText = "清空全部剪贴板历史？"
-        alert.informativeText = "所有记录（包括收藏和图片）都将被删除，此操作无法撤销。"
+        alert.informativeText = "所有记录（包括收藏、置顶和图片）都将被删除，此操作无法撤销。"
         alert.addButton(withTitle: "取消")
         alert.addButton(withTitle: "全部清空")
         alert.buttons.last?.hasDestructiveAction = true
@@ -393,7 +417,7 @@ public final class ClipboardPanelController: NSObject {
                 debounceWorkItem?.cancel()
                 debounceWorkItem = nil
                 reloadGate.beginClear()
-                clearButton.isEnabled = false
+                clearHistoryMenuItem.isEnabled = false
                 do {
                     let result = try await store.clear()
                     state.apply(
@@ -414,7 +438,7 @@ public final class ClipboardPanelController: NSObject {
                     }
                 } catch {
                     let shouldReload = reloadGate.finishClear()
-                    clearButton.isEnabled = state.hasAnyHistory
+                    clearHistoryMenuItem.isEnabled = state.hasAnyHistory
                     showError(error)
                     if shouldReload {
                         performReload(hideErrorOnSuccess: false)
@@ -424,14 +448,26 @@ public final class ClipboardPanelController: NSObject {
         }
     }
 
-    @objc private func toggleFavoriteFromButton(_ sender: NSButton) {
-        guard state.items.indices.contains(sender.tag) else { return }
-        toggleFavorite(state.items[sender.tag])
-    }
-
     @objc private func toggleFavoriteFromMenu() {
         guard let item = state.selectedItem else { return }
         toggleFavorite(item)
+    }
+
+    @objc private func togglePinnedFromMenu() {
+        guard let item = state.selectedItem else { return }
+        togglePinned(item)
+    }
+
+    private func togglePinned(_ item: ClipboardItem) {
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            do {
+                try await store.setPinned(id: item.id, isPinned: !item.isPinned)
+                reload()
+            } catch {
+                showError(error)
+            }
+        }
     }
 
     private func toggleFavorite(_ item: ClipboardItem) {
@@ -467,6 +503,12 @@ public final class ClipboardPanelController: NSObject {
         let menu = NSMenu(title: "剪贴板记录")
         menu.delegate = self
         menu.addItem(NSMenuItem(title: "复制", action: #selector(restoreSelection), keyEquivalent: ""))
+        let pinnedTitle = state.items[row].isPinned ? "取消置顶" : "置顶"
+        menu.addItem(NSMenuItem(
+            title: pinnedTitle,
+            action: #selector(togglePinnedFromMenu),
+            keyEquivalent: ""
+        ))
         let favoriteTitle = state.items[row].isFavorite ? "取消收藏" : "收藏"
         menu.addItem(NSMenuItem(title: favoriteTitle, action: #selector(toggleFavoriteFromMenu), keyEquivalent: ""))
         menu.addItem(.separator())
@@ -477,7 +519,7 @@ public final class ClipboardPanelController: NSObject {
 
     private func showError(_ error: Error) {
         if case ClipboardStoreError.assetCapacityExceeded = error {
-            showErrorMessage("剪贴板历史空间已满，请删除收藏图片")
+            showErrorMessage("剪贴板历史空间已满，请删除收藏或置顶图片")
         } else {
             showErrorMessage("操作失败：\(error.localizedDescription)")
         }
@@ -530,18 +572,27 @@ public final class ClipboardPanelController: NSObject {
                     return
                 }
 
-                guard let data = try await store.assetData(for: item),
-                      !Task.isCancelled,
-                      cell.thumbnailRequestID == requestID,
-                      cell.representedItemID == item.id,
-                      let decoded = await thumbnailLoader.thumbnail(
+                let decoded: CGImage?
+                if let fileURL = presentation.thumbnailFileURL {
+                    decoded = await thumbnailLoader.thumbnail(
+                        for: item.id,
+                        fileURL: fileURL,
+                        maximumPixelSize: 84
+                    )
+                } else if let data = try await store.assetData(for: item) {
+                    decoded = await thumbnailLoader.thumbnail(
                         for: item.id,
                         data: data,
                         maximumPixelSize: 84
-                      ),
-                      !Task.isCancelled,
+                    )
+                } else {
+                    decoded = nil
+                }
+
+                guard !Task.isCancelled,
                       cell.thumbnailRequestID == requestID,
-                      cell.representedItemID == item.id else {
+                      cell.representedItemID == item.id,
+                      let decoded else {
                     return
                 }
                 cell.showThumbnail(NSImage(
@@ -549,7 +600,7 @@ public final class ClipboardPanelController: NSObject {
                     size: NSSize(width: decoded.width, height: decoded.height)
                 ))
             } catch {
-                // Keep the photo placeholder when an old image resource is unavailable.
+                // Keep the type placeholder when an image resource is unavailable.
             }
         }
     }
@@ -585,15 +636,8 @@ extension ClipboardPanelController: NSTableViewDataSource, NSTableViewDelegate {
         cell.summaryField.stringValue = presentation.summary
         cell.summaryField.fullText = presentation.toolTip
         cell.detailField.stringValue = detail(for: item)
+        cell.pinImage.isHidden = !item.isPinned
         configureThumbnail(for: item, presentation: presentation, in: cell)
-        cell.favoriteButton.image = NSImage(
-            systemSymbolName: item.isFavorite ? "star.fill" : "star",
-            accessibilityDescription: item.isFavorite ? "取消收藏" : "收藏"
-        )
-        cell.favoriteButton.contentTintColor = item.isFavorite ? .systemYellow : .secondaryLabelColor
-        cell.favoriteButton.tag = row
-        cell.favoriteButton.target = self
-        cell.favoriteButton.action = #selector(toggleFavoriteFromButton(_:))
         return cell
     }
 
@@ -601,6 +645,11 @@ extension ClipboardPanelController: NSTableViewDataSource, NSTableViewDelegate {
         let row = tableView.selectedRow
         state.select(id: state.items.indices.contains(row) ? state.items[row].id : nil)
     }
+
+    public func tableView(_ tableView: NSTableView, rowViewForRow row: Int) -> NSTableRowView? {
+        ClipboardHistoryRowView()
+    }
+
 }
 
 extension ClipboardPanelController: NSMenuDelegate {
@@ -633,11 +682,24 @@ private final class ClipboardHistoryTableView: NSTableView {
     }
 }
 
+private final class ClipboardHistoryRowView: NSTableRowView {
+    override func drawSelection(in dirtyRect: NSRect) {
+        guard selectionHighlightStyle != .none else { return }
+        let selectionRect = bounds.insetBy(
+            dx: ClipboardPanelLayout.rowSelectionHorizontalInset,
+            dy: 1
+        )
+        let path = NSBezierPath(roundedRect: selectionRect, xRadius: 8, yRadius: 8)
+        NSColor.controlAccentColor.withAlphaComponent(0.12).setFill()
+        path.fill()
+    }
+}
+
 private final class ClipboardHistoryCellView: NSTableCellView {
     let kindImage = NSImageView()
     let summaryField = ClipboardHoverTextField()
     let detailField = NSTextField(labelWithString: "")
-    let favoriteButton = NSButton()
+    let pinImage = NSImageView()
     var representedItemID: UUID?
     var thumbnailRequestID: UUID?
     var thumbnailTask: Task<Void, Never>?
@@ -645,49 +707,51 @@ private final class ClipboardHistoryCellView: NSTableCellView {
     init(identifier: NSUserInterfaceItemIdentifier) {
         super.init(frame: .zero)
         self.identifier = identifier
-        wantsLayer = true
-        layer?.cornerRadius = 7
-
-        kindImage.symbolConfiguration = .init(pointSize: 17, weight: .regular)
+        kindImage.symbolConfiguration = .init(pointSize: 14, weight: .regular)
         kindImage.contentTintColor = .labelColor
         kindImage.imageScaling = .scaleProportionallyUpOrDown
         kindImage.wantsLayer = true
         kindImage.translatesAutoresizingMaskIntoConstraints = false
 
-        summaryField.font = .systemFont(ofSize: 13, weight: .medium)
+        summaryField.font = .systemFont(ofSize: ClipboardPanelLayout.summaryFontSize, weight: .medium)
         summaryField.lineBreakMode = .byTruncatingTail
         summaryField.maximumNumberOfLines = 1
         summaryField.translatesAutoresizingMaskIntoConstraints = false
 
-        detailField.font = .systemFont(ofSize: 11)
+        detailField.font = .systemFont(ofSize: ClipboardPanelLayout.detailFontSize)
         detailField.textColor = .secondaryLabelColor
         detailField.lineBreakMode = .byTruncatingTail
         detailField.translatesAutoresizingMaskIntoConstraints = false
 
-        favoriteButton.isBordered = false
-        favoriteButton.bezelStyle = .inline
-        favoriteButton.toolTip = "收藏"
-        favoriteButton.translatesAutoresizingMaskIntoConstraints = false
+        pinImage.image = NSImage(
+            systemSymbolName: "pin.fill",
+            accessibilityDescription: "已置顶"
+        )?.withSymbolConfiguration(.init(pointSize: 9, weight: .medium))
+        pinImage.imageScaling = .scaleProportionallyDown
+        pinImage.contentTintColor = .secondaryLabelColor
+        pinImage.toolTip = "已置顶"
+        pinImage.isHidden = true
+        pinImage.translatesAutoresizingMaskIntoConstraints = false
 
         addSubview(kindImage)
         addSubview(summaryField)
         addSubview(detailField)
-        addSubview(favoriteButton)
+        addSubview(pinImage)
         NSLayoutConstraint.activate([
-            kindImage.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 8),
+            kindImage.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 4),
             kindImage.centerYAnchor.constraint(equalTo: centerYAnchor),
-            kindImage.widthAnchor.constraint(equalToConstant: 42),
-            kindImage.heightAnchor.constraint(equalToConstant: 42),
-            favoriteButton.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -8),
-            favoriteButton.centerYAnchor.constraint(equalTo: centerYAnchor),
-            favoriteButton.widthAnchor.constraint(equalToConstant: 26),
-            favoriteButton.heightAnchor.constraint(equalToConstant: 26),
-            summaryField.leadingAnchor.constraint(equalTo: kindImage.trailingAnchor, constant: 10),
-            summaryField.trailingAnchor.constraint(equalTo: favoriteButton.leadingAnchor, constant: -8),
-            summaryField.topAnchor.constraint(equalTo: topAnchor, constant: 9),
+            kindImage.widthAnchor.constraint(equalToConstant: ClipboardPanelLayout.rowIconSize),
+            kindImage.heightAnchor.constraint(equalToConstant: ClipboardPanelLayout.rowIconSize),
+            summaryField.leadingAnchor.constraint(equalTo: kindImage.trailingAnchor, constant: 8),
+            summaryField.trailingAnchor.constraint(equalTo: pinImage.leadingAnchor, constant: -5),
+            summaryField.topAnchor.constraint(equalTo: topAnchor, constant: 6),
+            pinImage.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -8),
+            pinImage.centerYAnchor.constraint(equalTo: summaryField.centerYAnchor),
+            pinImage.widthAnchor.constraint(equalToConstant: 11),
+            pinImage.heightAnchor.constraint(equalToConstant: 11),
             detailField.leadingAnchor.constraint(equalTo: summaryField.leadingAnchor),
-            detailField.trailingAnchor.constraint(equalTo: summaryField.trailingAnchor),
-            detailField.topAnchor.constraint(equalTo: summaryField.bottomAnchor, constant: 4)
+            detailField.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -8),
+            detailField.topAnchor.constraint(equalTo: summaryField.bottomAnchor, constant: 3)
         ])
     }
 

@@ -87,7 +87,12 @@ public struct ClipboardItem: Identifiable, Equatable, Sendable {
     public let updatedAt: Date
     public let lastRestoredAt: Date?
     public let isFavorite: Bool
+    public let isPinned: Bool
     public let byteSize: Int64
+
+    public var isProtectedFromCleanup: Bool {
+        isFavorite || isPinned
+    }
 
     public init(
         id: UUID,
@@ -101,6 +106,7 @@ public struct ClipboardItem: Identifiable, Equatable, Sendable {
         updatedAt: Date,
         lastRestoredAt: Date?,
         isFavorite: Bool,
+        isPinned: Bool = false,
         byteSize: Int64
     ) {
         self.id = id
@@ -114,6 +120,7 @@ public struct ClipboardItem: Identifiable, Equatable, Sendable {
         self.updatedAt = updatedAt
         self.lastRestoredAt = lastRestoredAt
         self.isFavorite = isFavorite
+        self.isPinned = isPinned
         self.byteSize = byteSize
     }
 }
